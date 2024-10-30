@@ -5,7 +5,6 @@ var cookieParser = require('cookie-parser');
 var logger = require('morgan');
 const loadRouter = require('./routes');
 const bodyParser = require('body-parser');
-const user = require('./routes/users');
 const websocketServer = require('./websocket')
 
 var app = express();

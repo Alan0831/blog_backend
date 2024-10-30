@@ -36,7 +36,7 @@ const schemaDeleteArticle = joi.object({
 class ArticleControllers {
     //  获取文章列表
     static async getArticleList(req, res, next) {
-        const { page = 1, pageSize = 10, preview = 1, keyword = '', userId = ''} = req.body;
+        const { pageNum = 1, pageSize = 10, preview = 1, keyword = '', userId = ''} = req.body;
         let articleOrder = [['createdAt', 'DESC']];
         let author = '';
         let findParam = {};
@@ -57,7 +57,7 @@ class ArticleControllers {
                         include: [{ model: ReplyModel, attributes: ['id'] }]
                     }
                 ],
-                offset: (page - 1) * pageSize,
+                offset: (pageNum - 1) * pageSize,
                 limit: parseInt(pageSize),
                 order: articleOrder,
                 row: true,
@@ -86,7 +86,7 @@ class ArticleControllers {
                         include: [{ model: ReplyModel, attributes: ['id'] }]
                     }
                 ],
-                offset: (page - 1) * pageSize,
+                offset: (pageNum - 1) * pageSize,
                 limit: parseInt(pageSize),
                 order: articleOrder,
                 row: true,
@@ -107,6 +107,8 @@ class ArticleControllers {
                  d.content = d.content.slice(0, 500); // 预览模式减少传输数据
                 })
             }
+            data.pageSize = pageSize;
+            data.pageNum = pageNum;
             packageResponse('success', { data }, res);
         }
     }
@@ -214,7 +216,8 @@ class ArticleControllers {
         if (!error) {
             const { articleId, title, content, categoryList = [], tagList = [], authorId, type, top } = req.body;
             try {
-                await ArticleModel.update({ title, content }, { where: { id: articleId } });
+                const tags = tagList || [];
+                await ArticleModel.update({ title, content, tagList: JSON.stringify(tags), }, { where: { id: articleId } });
                 packageResponse('success', { successMessage: '修改文章成功' }, res);
             } catch (err) {
                 packageResponse('error', { errorMessage: '修改文章失败: ' + err }, res);

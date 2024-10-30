@@ -77,6 +77,7 @@ class ArticleControllers {
                     },
                 ],
                 row: true,
+                order: [['createdAt', 'DESC']]
             },
             )
             if (data) {
