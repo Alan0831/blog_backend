@@ -1,4 +1,4 @@
-const { article: ArticleModel, comment: CommentModel, user: UserModel, reply: ReplyModel, articleclass: ArticleclassModel, sequelize } = require('../models')
+const { article: ArticleModel, comment: CommentModel, user: UserModel, reply: ReplyModel, articleclass: ArticleclassModel, privacyarticle: PrivacyArticleModel, sequelize } = require('../models')
 const { packageResponse } = require('../utils/packageRespponse')
 const joi = require('joi');
 const { v4: uuidv4 } = require('uuid');
@@ -19,7 +19,9 @@ const schemaCreateArticle = joi.object({
     tagList: joi.array(),
     type: joi.boolean(),
     top: joi.boolean(),
-    classId: joi.number(),
+    classId: joi.number().allow(null, ''),
+    isLock: joi.number(),
+    password: joi.string().allow(null, ''),
 });
 const schemaEditArticle = joi.object({
     articleId: joi.number().required(),
@@ -31,7 +33,7 @@ const schemaEditArticle = joi.object({
     type: joi.boolean(),
     top: joi.boolean(),
     oldClassId: joi.number(),
-    classId: joi.number(),
+    classId: joi.number().allow(null, ''),
 });
 const schemaDeleteArticle = joi.object({
     articleId: joi.number().required(),
@@ -48,6 +50,10 @@ const schemaSetArticleClass = joi.object({
     classId: joi.number().required(),
     userId: joi.number().required(),
     oldClassId: joi.number(),
+});
+const schemaValidateArticleLock = joi.object({
+    articleId: joi.number().required(),
+    password: joi.string().required(),
 });
 
 class ArticleControllers {
@@ -198,7 +204,7 @@ class ArticleControllers {
         const { error } = schemaCreateArticle.validate(req.body);
 
         if (!error) {
-            const { title, content, classId = null, tagList = [], authorId, type, top } = req.body;
+            const { title, content, classId = null, tagList = [], authorId, isLock, password, type, top } = req.body;
             const result = await ArticleModel.findOne({ where: { title } });
             console.log(result);
             if (result) {
@@ -211,11 +217,15 @@ class ArticleControllers {
                     const authorData = await find({id: authorId});
                     if (authorData) {
                         const data = await ArticleModel.create(
-                            { title, content, articleclassId: classId, tagList: JSON.stringify(tags), author: authorData.username, userId: authorId },
+                            { title, content, isLock, articleclassId: classId, tagList: JSON.stringify(tags), author: authorData.username, userId: authorId },
                         )
                         //  如果传了classId，则更新文章归属大类
                         if (classId) {
                             await ArticleControllers._setArticleClass(data.id, classId, authorId);
+                        }
+                        //  如果设置了加锁，则设置密码
+                        if (isLock === 2) {
+                            await ArticleControllers.setArticleLock(data.id, authorId, password);
                         }
                         packageResponse('success', { data, successMessage: '创建文章成功' }, res);
                     } else {
@@ -397,6 +407,33 @@ class ArticleControllers {
             }
         } catch(err) {
             throw new Error(err);
+        }
+    }
+
+    //  设置文章锁
+    static async setArticleLock(articleId, userId, password) {
+        await PrivacyArticleModel.create(
+            { articleId, userId, password },
+        )
+    }
+
+    //  检验文章锁
+    static async validateArticleLock(req, res, next) {
+        const { error } = schemaValidateArticleLock.validate(req.body);
+        if (!error) {
+            const { articleId, password } = req.body;
+            try {
+                const result = await PrivacyArticleModel.findOne({ where: { articleId } });
+                if (result.password === password) {
+                    packageResponse('success', { successMessage: '解锁成功' }, res);
+                } else {
+                    packageResponse('error', { errorMessage: '密码错误' }, res);
+                }
+            } catch (err) {
+                packageResponse('error', { errorMessage: err }, res);
+            }
+        } else {
+            packageResponse('error', { errorMessage: error }, res);
         }
     }
 }

@@ -13,6 +13,11 @@ module.exports = (sequelize, dataTypes) => {
       collectionCount: { type: dataTypes.INTEGER(11), defaultValue: 0 }, // 收藏数
       recommend: { type: dataTypes.INTEGER(11), defaultValue: 0 }, // 热度
       tagList: {type: dataTypes.STRING(255), allowNull: false},
+      isLock: {
+        type: dataTypes.TINYINT,
+        defaultValue: 1,
+        comment: '是否上锁:1 - 未上锁, 2 - 加锁'
+      },
       createdAt: {
         type: dataTypes.DATE,
         defaultValue: dataTypes.NOW,

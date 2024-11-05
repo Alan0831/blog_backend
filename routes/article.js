@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { getArticleList, findArticleById, createArticle, editArticle, deleteArticle, getRecommendArticleList,
-    createArticleClassName, searchArticleClassName, setArticleClass
+    createArticleClassName, searchArticleClassName, setArticleClass, validateArticleLock
  } = require('../controllers/article')
 
 router.post('/getArticleList', getArticleList);
@@ -13,5 +13,6 @@ router.post('/getRecommendArticleList', getRecommendArticleList);
 router.post('/createArticleClassName', createArticleClassName);
 router.post('/searchArticleClassName', searchArticleClassName);
 router.post('/setArticleClass', setArticleClass);
+router.post('/validateArticleLock', validateArticleLock);
 
 module.exports = router
