@@ -1,4 +1,4 @@
-const { article: ArticleModel, comment: CommentModel, user: UserModel, reply: ReplyModel, sequelize } = require('../models')
+const { article: ArticleModel, comment: CommentModel, user: UserModel, reply: ReplyModel, articleclass: ArticleclassModel, sequelize } = require('../models')
 const { packageResponse } = require('../utils/packageRespponse')
 const joi = require('joi');
 const { v4: uuidv4 } = require('uuid');
@@ -19,6 +19,7 @@ const schemaCreateArticle = joi.object({
     tagList: joi.array(),
     type: joi.boolean(),
     top: joi.boolean(),
+    classId: joi.number(),
 });
 const schemaEditArticle = joi.object({
     articleId: joi.number().required(),
@@ -29,10 +30,26 @@ const schemaEditArticle = joi.object({
     tagList: joi.array(),
     type: joi.boolean(),
     top: joi.boolean(),
+    oldClassId: joi.number(),
+    classId: joi.number(),
 });
 const schemaDeleteArticle = joi.object({
     articleId: joi.number().required(),
 });
+const schemaCreateArticleClassName = joi.object({
+    className: joi.string().required(),
+    userId: joi.number().required(),
+});
+const schemaSearchArticleClassName = joi.object({
+    userId: joi.number().required(),
+});
+const schemaSetArticleClass = joi.object({
+    articleId: joi.number().required(),
+    classId: joi.number().required(),
+    userId: joi.number().required(),
+    oldClassId: joi.number(),
+});
+
 class ArticleControllers {
     //  获取文章列表
     static async getArticleList(req, res, next) {
@@ -181,7 +198,7 @@ class ArticleControllers {
         const { error } = schemaCreateArticle.validate(req.body);
 
         if (!error) {
-            const { title, content, categoryList = [], tagList = [], authorId, type, top } = req.body;
+            const { title, content, classId = null, tagList = [], authorId, type, top } = req.body;
             const result = await ArticleModel.findOne({ where: { title } });
             console.log(result);
             if (result) {
@@ -194,8 +211,12 @@ class ArticleControllers {
                     const authorData = await find({id: authorId});
                     if (authorData) {
                         const data = await ArticleModel.create(
-                            { title, content, tagList: JSON.stringify(tags), author: authorData.username, userId: authorId },
+                            { title, content, articleclassId: classId, tagList: JSON.stringify(tags), author: authorData.username, userId: authorId },
                         )
+                        //  如果传了classId，则更新文章归属大类
+                        if (classId) {
+                            await ArticleControllers._setArticleClass(data.id, classId, authorId);
+                        }
                         packageResponse('success', { data, successMessage: '创建文章成功' }, res);
                     } else {
                         packageResponse('error', { errorMessage: '创建文章失败: 未找到该作者'}, res);
@@ -214,10 +235,14 @@ class ArticleControllers {
     static async editArticle(req, res, next) {
         const { error } = schemaEditArticle.validate(req.body);
         if (!error) {
-            const { articleId, title, content, categoryList = [], tagList = [], authorId, type, top } = req.body;
+            const { articleId, title, content, oldClassId = null, classId = null, tagList = [], authorId, type, top } = req.body;
             try {
                 const tags = tagList || [];
-                await ArticleModel.update({ title, content, tagList: JSON.stringify(tags), }, { where: { id: articleId } });
+                const data = await ArticleModel.update({ title, content, articleclassId: classId, tagList: JSON.stringify(tags), }, { where: { id: articleId } });
+                //  如果传了classId，则更新文章归属大类
+                if (classId) {
+                    await ArticleControllers._updateArticleClass(data.id, oldClassId, classId, authorId);
+                }
                 packageResponse('success', { successMessage: '修改文章成功' }, res);
             } catch (err) {
                 packageResponse('error', { errorMessage: '修改文章失败: ' + err }, res);
@@ -255,6 +280,123 @@ class ArticleControllers {
             }
         } else {
             packageResponse('error', { errorMessage: '删除文章失败: ' + error }, res);
+        }
+    }
+
+    // 创建文章大类
+    static async createArticleClassName(req, res, next) {
+        const { error } = schemaCreateArticleClassName.validate(req.body);
+        if (!error) {
+            const { className, userId } = req.body;
+            try {
+                const data = await ArticleclassModel.create(
+                    { className, userId },
+                )
+                packageResponse('success', { data, successMessage: '创建文章大类成功' }, res);
+            } catch (err) {
+                packageResponse('error', { errorMessage: '创建文章大类失败: ' + err }, res);
+            }
+        } else {
+            packageResponse('error', { errorMessage: '创建文章大类失败: ' + error }, res);
+        }
+    }
+
+    //  查询文章大类
+    static async searchArticleClassName(req, res, next) {
+        const { error } = schemaSearchArticleClassName.validate(req.body);
+        if (!error) {
+            const { userId } = req.body;
+            try {
+                const data = await ArticleclassModel.findAndCountAll({
+                    where: { userId }
+                })
+                packageResponse('success', { data }, res);
+            } catch (err) {
+                packageResponse('error', { errorMessage: err }, res);
+            }
+        } else {
+            packageResponse('error', { errorMessage: error }, res);
+        }
+    }
+
+    //  设置文章归属大类
+    static async setArticleClass(req, res, next) {
+        const { error } = schemaSetArticleClass.validate(req.body);
+        if (!error) {
+            const { articleId, oldClassId, classId, userId } = req.body;
+            try {
+                await ArticleModel.update({ articleclassId: classId }, { where: { id: articleId } });
+                if (oldClassId != -1) {
+                    await ArticleControllers._updateArticleClass(articleId, oldClassId, classId, userId);
+                } else {
+                    await ArticleControllers._setArticleClass(articleId, classId, userId);
+                }
+                
+                packageResponse('success', { successMessage: '设置成功' }, res);
+            } catch (err) {
+                packageResponse('error', { errorMessage: '设置文章大类失败: ' + err }, res);
+            }
+        } else {
+            packageResponse('error', { errorMessage: '设置文章大类失败: ' + error }, res);
+        }
+    }
+
+    // 在文章归属大类内插入文章ID
+    static async _setArticleClass(articleId, classId, userId) {
+        try {
+            const articleClassData = await ArticleclassModel.findOne({
+                where: {id: classId, userId}
+            });
+            if (articleClassData) {
+                if (articleClassData.articleList && JSON.parse(articleClassData.articleList).length !== 0) {
+                    let list = JSON.parse(articleClassData.articleList);
+                    list.push(articleId);
+                    list = JSON.stringify(list);
+                    await articleClassData.update({ articleList: list }, { where: { id: classId, userId } });
+                } else {
+                    let list =  JSON.stringify([articleId]);
+                    await articleClassData.update({ articleList: list }, { where: { id: classId, userId } });
+                }
+                
+            }
+        } catch(err) {
+            throw new Error(err);
+        }
+    }
+
+    // 更新文章归属大类内插入文章ID
+    static async _updateArticleClass(articleId, oldClassId, classId, userId) {
+        try {
+            const articleClassData = await ArticleclassModel.findOne({
+                where: {id: classId, userId}
+            });
+            const oldArticleClassData = await ArticleclassModel.findOne({
+                where: {id: oldClassId, userId}
+            });
+            if (articleClassData) {
+                if (articleClassData.articleList && JSON.parse(articleClassData.articleList).length !== 0) {
+                    let list = JSON.parse(articleClassData.articleList);
+                    list.push(articleId);
+                    list = JSON.stringify(list);
+                    await articleClassData.update({ articleList: list }, { where: { id: classId, userId } });
+                } else {
+                    let list =  JSON.stringify([articleId]);
+                    await articleClassData.update({ articleList: list }, { where: { id: classId, userId } });
+                }
+            }
+            if (oldArticleClassData) {
+                if (oldArticleClassData.articleList && JSON.parse(oldArticleClassData.articleList).length !== 0) {
+                    let oldList = JSON.parse(oldArticleClassData.articleList);
+                    console.log(oldList);
+                    let _oldList = oldList.filter((item) => item != articleId);
+                    _oldList = JSON.stringify(_oldList);
+                    console.log(_oldList);
+                    
+                    await oldArticleClassData.update({ articleList: _oldList }, { where: { id: oldClassId, userId } });
+                }
+            }
+        } catch(err) {
+            throw new Error(err);
         }
     }
 }

@@ -44,6 +44,11 @@ module.exports = (sequelize, dataTypes) => {
       targetKey: 'id',
       constraints: false
     });
+    Article.belongsTo(models.articleclass, {
+      foreignKey: 'articleclassId',
+      targetKey: 'id',
+      constraints: false
+    });
   }
 
   return Article
