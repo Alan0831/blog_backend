@@ -1,8 +1,8 @@
 const moment = require('moment')
-// article 表
+// videoreply 表
 module.exports = (sequelize, dataTypes) => {
-  const Reply = sequelize.define(
-    'reply',
+  const VideoReply = sequelize.define(
+    'videoreply',
     {
       id: {
         type: dataTypes.INTEGER(11),
@@ -32,18 +32,18 @@ module.exports = (sequelize, dataTypes) => {
     }
   )
 
-  Reply.associate = models => {
-    Reply.belongsTo(models.user, {
+  VideoReply.associate = models => {
+    VideoReply.belongsTo(models.user, {
       foreignKey: 'userId',
       targetKey: 'id',
       constraints: false
     });
-    Reply.belongsTo(models.comment, {
-      foreignKey: 'commentId',
+    VideoReply.belongsTo(models.videocomment, {
+      foreignKey: 'videocommentId',
       targetKey: 'id',
       constraints: false
     });
   }
 
-  return Reply
+  return VideoReply
 }

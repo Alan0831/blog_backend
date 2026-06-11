@@ -24,6 +24,7 @@ exports.checkToken = (req, res) => {
     } else if (decoded) {
       let expTime = decoded.exp;
       let currentTime = new Date().getTime();
+      console.log(expTime);
       if (expTime > parseInt(currentTime / 1000)) {  // 当前时间小于过期时间，则token有效
         isVerify = true;
       } else {

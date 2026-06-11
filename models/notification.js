@@ -15,6 +15,7 @@ module.exports = (sequelize, dataTypes) => {
             toName: dataTypes.STRING(50),
             content: { type: dataTypes.TEXT },
             articleId: dataTypes.INTEGER(11), // 所属文章 id
+            videoId: dataTypes.INTEGER(11), // 所属视频 id
             read: { type: dataTypes.INTEGER(11), defaultValue: 0 }, // 是否已读  0 未读；1 已读
             createdAt: {
                 type: dataTypes.DATE,

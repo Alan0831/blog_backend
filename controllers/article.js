@@ -1,10 +1,10 @@
-const { article: ArticleModel, comment: CommentModel, user: UserModel, reply: ReplyModel, articleclass: ArticleclassModel, privacyarticle: PrivacyArticleModel, sequelize } = require('../models')
+const { article: ArticleModel, comment: CommentModel, user: UserModel, tag: TagModel, reply: ReplyModel, articleclass: ArticleclassModel, friendcircle: FriendCircleModel, privacyarticle: PrivacyArticleModel, sequelize } = require('../models')
 const { packageResponse } = require('../utils/packageRespponse')
 const joi = require('joi');
 const { v4: uuidv4 } = require('uuid');
 const { find } = require('../controllers/user');
 const { findIsCollection } = require('../controllers/collection');
-
+const { logger } = require('../middlewares/logger');
 
 const schemaSearchArticle = joi.object({
     id: joi.number().required(),
@@ -20,8 +20,9 @@ const schemaCreateArticle = joi.object({
     type: joi.boolean(),
     top: joi.boolean(),
     classId: joi.number().allow(null, ''),
-    isLock: joi.number(),
+    visibleType: joi.number(),
     password: joi.string().allow(null, ''),
+    articleCover: joi.string().allow(null, ''),
 });
 const schemaEditArticle = joi.object({
     articleId: joi.number().required(),
@@ -34,6 +35,9 @@ const schemaEditArticle = joi.object({
     top: joi.boolean(),
     oldClassId: joi.number(),
     classId: joi.number().allow(null, ''),
+    visibleType: joi.number().allow(null, ''),
+    password: joi.string().allow(null, ''),
+    articleCover: joi.string().allow(null, ''),
 });
 const schemaDeleteArticle = joi.object({
     articleId: joi.number().required(),
@@ -55,20 +59,25 @@ const schemaValidateArticleLock = joi.object({
     articleId: joi.number().required(),
     password: joi.string().required(),
 });
+const schemaSearchLikeArticle = joi.object({
+    articleId: joi.number().required(),
+});
 
 class ArticleControllers {
     //  获取文章列表
     static async getArticleList(req, res, next) {
-        const { pageNum = 1, pageSize = 10, preview = 1, keyword = '', userId = ''} = req.body;
+        const { pageNum = 1, pageSize = 10, preview = 1, keyword = '', userId = '' } = req.body;
+        let localIP = req?.socket?.remoteAddress || '';
         let articleOrder = [['createdAt', 'DESC']];
         let author = '';
         let findParam = {};
         // 如果传值有userId，则查询对应的author
         if (userId) {
-            const authorData = await find({id: userId});
+            logger.info(`============userId为:${userId},IP为${localIP}的用户开始请求文章列表============`);
+            const authorData = await find({ id: userId });
             if (!authorData) return;
             author = authorData.username;
-            findParam =  {
+            findParam = {
                 where: {
                     author
                 },
@@ -87,11 +96,11 @@ class ArticleControllers {
                 distinct: true // count 计算
             };
         } else {
-            findParam =  {
+            logger.info(`============IP为${localIP}的用户开始请求文章列表============`);
+            findParam = {
                 where: {
-                    id: {
-                        $not: -1 // 过滤关于页面的副本
-                    },
+                    id: { $not: -1 },   // 过滤关于页面的副本
+                    visibleType: { $not: 3 },
                     $or: {
                         title: {
                             $like: `%${keyword}%`
@@ -119,7 +128,7 @@ class ArticleControllers {
 
         // 如果是查询个人文章列表，则不返回文章内容
         if (author) {
-            findParam.attributes = {exclude: ['content']};
+            findParam.attributes = { exclude: ['content'] };
         }
         if (Object.keys(findParam).length === 0) {
             packageResponse('success', { data: {} }, res);
@@ -127,7 +136,7 @@ class ArticleControllers {
             const data = await ArticleModel.findAndCountAll(findParam);
             if (preview === 1 && !author) {
                 data.rows.forEach(d => {
-                 d.content = d.content.slice(0, 500); // 预览模式减少传输数据
+                    d.content = d.content.slice(0, 500); // 预览模式减少传输数据
                 })
             }
             data.pageSize = pageSize;
@@ -136,11 +145,44 @@ class ArticleControllers {
         }
     }
 
+    //  获取alan的文章
+    static async getArticleListFromAlan(req, res, next) {
+        const { pageNum = 1, pageSize = 10 } = req.body;
+        let articleOrder = [['createdAt', 'DESC']];
+        let findParam = {
+            where: {
+                author: 'alan',
+                visibleType: { $not: 3 }
+            },
+            include: [
+                {
+                    model: CommentModel,
+                    attributes: ['id', 'content', 'createdAt'],
+                    include: [{ model: ReplyModel, attributes: ['id'] }]
+                }
+            ],
+            offset: (pageNum - 1) * pageSize,
+            limit: parseInt(pageSize),
+            order: articleOrder,
+            row: true,
+            distinct: true // count 计算
+        };
+        try {
+            const data = await ArticleModel.findAndCountAll(findParam);
+            data.pageSize = pageSize;
+            data.pageNum = pageNum;
+            packageResponse('success', { data }, res);
+        } catch (err) {
+            packageResponse('error', { errorMessage: err }, res);
+        }
+    }
+
     //   获取推荐文章列表
     static async getRecommendArticleList(req, res, next) {
         let articleOrder = [['recommend', 'DESC']];
         let findParam = {
-            attributes: {exclude: ['content']},
+            where: { visibleType: { $not: 3 } },
+            attributes: { exclude: ['content'] },
             limit: 6,
             order: articleOrder,
             row: true,
@@ -150,19 +192,21 @@ class ArticleControllers {
             const data = await ArticleModel.findAndCountAll(findParam);
             packageResponse('success', { data }, res);
         } catch (err) {
-            packageResponse('error', {errorMessage: err}, res);
+            packageResponse('error', { errorMessage: err }, res);
         }
-        
+
     }
 
     // 获取文章详情
     static async findArticleById(req, res, next) {
         const { error } = schemaSearchArticle.validate(req.body);
+        let localIP = req?.socket?.remoteAddress || '';
         if (error) {
-            packageResponse('error', {errorMessage: error}, res);
+            packageResponse('error', { errorMessage: error }, res);
         } else {
             const { id, owner } = req.body;
-            const isCollected = await findIsCollection(owner, id);
+            logger.info(`============用户ID:${owner},IP为${localIP}请求文章:${id}============`);
+            const isCollected = await findIsCollection(owner, id, 1);
             const data = await ArticleModel.findOne({
                 where: { id },
                 include: [
@@ -175,7 +219,7 @@ class ArticleControllers {
                         include: [
                             {
                                 model: ReplyModel,
-                                attributes: ['id', 'content', 'createdAt'],
+                                attributes: ['id', 'content', 'createdAt', 'replyUser'],
                                 include: [{ model: UserModel, as: 'user', attributes: { exclude: ['updatedAt', 'password'] } }],
                             },
                             { model: UserModel, as: 'user', attributes: { exclude: ['updatedAt', 'password'] } },
@@ -190,11 +234,11 @@ class ArticleControllers {
 
             if (data) {
                 // 更新点击数和热度
-                ArticleModel.update({ viewCount: ++data.viewCount, recommend: ++data.recommend }, { where: { id } });
-                let _data = {...data.dataValues, isCollected};
+                ArticleModel.update({ viewCount: ++data.viewCount, recommend: ++data.recommend }, { where: { id }, silent: true });
+                let _data = { ...data.dataValues, isCollected };
                 packageResponse('success', { data: _data }, res);
             } else {
-                packageResponse('error', {errorMessage: '该文章已不存在！'}, res);
+                packageResponse('error', { errorMessage: '该文章已不存在！' }, res);
             }
         }
     }
@@ -204,37 +248,50 @@ class ArticleControllers {
         const { error } = schemaCreateArticle.validate(req.body);
 
         if (!error) {
-            const { title, content, classId = null, tagList = [], authorId, isLock, password, type, top } = req.body;
+            const { title, content, classId = null, tagList = [], authorId, visibleType, password, articleCover, type, top } = req.body;
             const result = await ArticleModel.findOne({ where: { title } });
             console.log(result);
+            logger.info(`============用户ID:${authorId}创建文章============`);
             if (result) {
-                packageResponse('error', {errorMessage: '创建失败，该文章已存在！'}, res);
+                logger.info(`============用户ID:${authorId}创建文章失败，文章已存在============`);
+                packageResponse('error', { errorMessage: '创建失败，该文章已存在！' }, res);
             } else {
                 try {
                     const tags = tagList || [];
+                    // 新增tag标签
+                    tags.map(async (item) => {
+                        let currentTag = await TagModel.findOne({where: {tagName: item}});
+                        if (!currentTag) {
+                            await TagModel.create({tagName: item});
+                        }
+                    });
                     // const categories = categoryList.map(c => ({ name: c }))
                     const uuid = uuidv4().toString().replace(/-/g, '');
-                    const authorData = await find({id: authorId});
+                    const authorData = await find({ id: authorId });
                     if (authorData) {
                         const data = await ArticleModel.create(
-                            { title, content, isLock, articleclassId: classId, tagList: JSON.stringify(tags), author: authorData.username, userId: authorId },
+                            { title, content, articleCover, visibleType, articleclassId: classId, tagList: JSON.stringify(tags), author: authorData.username, userId: authorId },
                         )
                         //  如果传了classId，则更新文章归属大类
                         if (classId) {
                             await ArticleControllers._setArticleClass(data.id, classId, authorId);
                         }
                         //  如果设置了加锁，则设置密码
-                        if (isLock === 2) {
+                        if (visibleType === 2) {
                             await ArticleControllers.setArticleLock(data.id, authorId, password);
                         }
+
+                        // 记录到朋友圈
+                        FriendCircleModel.create({ userId: authorId, articleId: data.id, type: 1 });
                         packageResponse('success', { data, successMessage: '创建文章成功' }, res);
                     } else {
-                        packageResponse('error', { errorMessage: '创建文章失败: 未找到该作者'}, res);
+                        packageResponse('error', { errorMessage: '创建文章失败: 未找到该作者' }, res);
                     }
                 } catch (err) {
+                    logger.info(`============用户ID:${authorId}创建文章失败:${err}`);
                     packageResponse('error', { errorMessage: '创建文章失败: ' + err }, res);
                 }
-                
+
             }
         } else {
             packageResponse('error', { errorMessage: '创建文章失败: ' + error }, res);
@@ -245,16 +302,22 @@ class ArticleControllers {
     static async editArticle(req, res, next) {
         const { error } = schemaEditArticle.validate(req.body);
         if (!error) {
-            const { articleId, title, content, oldClassId = null, classId = null, tagList = [], authorId, type, top } = req.body;
+            const { articleId, title, content, oldClassId = null, articleCover, visibleType, password, classId = null, tagList = [], authorId, type, top } = req.body;
             try {
                 const tags = tagList || [];
-                const data = await ArticleModel.update({ title, content, articleclassId: classId, tagList: JSON.stringify(tags), }, { where: { id: articleId } });
+                const data = await ArticleModel.update({ title, content, articleCover, visibleType, articleclassId: classId, tagList: JSON.stringify(tags), }, { where: { id: articleId }, silent: true });
                 //  如果传了classId，则更新文章归属大类
                 if (classId) {
-                    await ArticleControllers._updateArticleClass(data.id, oldClassId, classId, authorId);
+                    await ArticleControllers._updateArticleClass(articleId, oldClassId, classId, authorId);
                 }
+                //  如果设置了加锁，则更新密码
+                if (visibleType === 2) {
+                    await ArticleControllers.updateArticleLock(articleId, authorId, password);
+                }
+                logger.info(`============用户ID:${authorId}修改文章:${articleId}============`);
                 packageResponse('success', { successMessage: '修改文章成功' }, res);
             } catch (err) {
+                logger.info(`============用户ID:${authorId}修改文章失败:${err}`);
                 packageResponse('error', { errorMessage: '修改文章失败: ' + err }, res);
             }
         } else {
@@ -278,17 +341,21 @@ class ArticleControllers {
                 //     where article.id=${articleId}`
                 // );
                 await sequelize.query(
-                    `delete comment, reply, article
+                    `delete comment, reply, privacyarticle, article
                     from article
                     left join reply on article.id=reply.articleId
                     left join comment on article.id=comment.articleId
+                    left join privacyarticle on article.id=privacyarticle.articleId
                     where article.id=${articleId}`
                 );
+                logger.info(`============用户删除文章:${articleId}============`);
                 packageResponse('success', { successMessage: '删除文章成功' }, res);
             } catch (err) {
+                logger.info(`============用户删除文章:${articleId}失败:${err}============`);
                 packageResponse('error', { errorMessage: '删除文章失败: ' + err }, res);
             }
         } else {
+            logger.info(`============用户删除文章:${articleId}失败:${err}============`);
             packageResponse('error', { errorMessage: '删除文章失败: ' + error }, res);
         }
     }
@@ -319,7 +386,7 @@ class ArticleControllers {
             try {
                 const data = await ArticleclassModel.findAndCountAll({
                     where: { userId }
-                })
+                });
                 packageResponse('success', { data }, res);
             } catch (err) {
                 packageResponse('error', { errorMessage: err }, res);
@@ -335,13 +402,13 @@ class ArticleControllers {
         if (!error) {
             const { articleId, oldClassId, classId, userId } = req.body;
             try {
-                await ArticleModel.update({ articleclassId: classId }, { where: { id: articleId } });
+                await ArticleModel.update({ articleclassId: classId }, { where: { id: articleId }, silent: true });
                 if (oldClassId != -1) {
                     await ArticleControllers._updateArticleClass(articleId, oldClassId, classId, userId);
                 } else {
                     await ArticleControllers._setArticleClass(articleId, classId, userId);
                 }
-                
+
                 packageResponse('success', { successMessage: '设置成功' }, res);
             } catch (err) {
                 packageResponse('error', { errorMessage: '设置文章大类失败: ' + err }, res);
@@ -355,7 +422,7 @@ class ArticleControllers {
     static async _setArticleClass(articleId, classId, userId) {
         try {
             const articleClassData = await ArticleclassModel.findOne({
-                where: {id: classId, userId}
+                where: { id: classId, userId }
             });
             if (articleClassData) {
                 if (articleClassData.articleList && JSON.parse(articleClassData.articleList).length !== 0) {
@@ -364,12 +431,12 @@ class ArticleControllers {
                     list = JSON.stringify(list);
                     await articleClassData.update({ articleList: list }, { where: { id: classId, userId } });
                 } else {
-                    let list =  JSON.stringify([articleId]);
+                    let list = JSON.stringify([articleId]);
                     await articleClassData.update({ articleList: list }, { where: { id: classId, userId } });
                 }
-                
+
             }
-        } catch(err) {
+        } catch (err) {
             throw new Error(err);
         }
     }
@@ -378,10 +445,10 @@ class ArticleControllers {
     static async _updateArticleClass(articleId, oldClassId, classId, userId) {
         try {
             const articleClassData = await ArticleclassModel.findOne({
-                where: {id: classId, userId}
+                where: { id: classId, userId }
             });
             const oldArticleClassData = await ArticleclassModel.findOne({
-                where: {id: oldClassId, userId}
+                where: { id: oldClassId, userId }
             });
             if (articleClassData) {
                 if (articleClassData.articleList && JSON.parse(articleClassData.articleList).length !== 0) {
@@ -390,22 +457,21 @@ class ArticleControllers {
                     list = JSON.stringify(list);
                     await articleClassData.update({ articleList: list }, { where: { id: classId, userId } });
                 } else {
-                    let list =  JSON.stringify([articleId]);
+                    let list = JSON.stringify([articleId]);
                     await articleClassData.update({ articleList: list }, { where: { id: classId, userId } });
                 }
             }
             if (oldArticleClassData) {
                 if (oldArticleClassData.articleList && JSON.parse(oldArticleClassData.articleList).length !== 0) {
                     let oldList = JSON.parse(oldArticleClassData.articleList);
-                    console.log(oldList);
                     let _oldList = oldList.filter((item) => item != articleId);
                     _oldList = JSON.stringify(_oldList);
                     console.log(_oldList);
-                    
+
                     await oldArticleClassData.update({ articleList: _oldList }, { where: { id: oldClassId, userId } });
                 }
             }
-        } catch(err) {
+        } catch (err) {
             throw new Error(err);
         }
     }
@@ -415,6 +481,17 @@ class ArticleControllers {
         await PrivacyArticleModel.create(
             { articleId, userId, password },
         )
+    }
+
+    //  更新文章锁
+    static async updateArticleLock(articleId, userId, password) {
+        console.log(articleId)
+        let lockData = await PrivacyArticleModel.findOne({ where: { articleId } });
+        if (lockData) {
+            PrivacyArticleModel.update({ password }, { where: { articleId } });
+        } else {
+            PrivacyArticleModel.create({ articleId, userId, password });
+        }
     }
 
     //  检验文章锁
@@ -429,6 +506,65 @@ class ArticleControllers {
                 } else {
                     packageResponse('error', { errorMessage: '密码错误' }, res);
                 }
+            } catch (err) {
+                packageResponse('error', { errorMessage: err }, res);
+            }
+        } else {
+            packageResponse('error', { errorMessage: error }, res);
+        }
+    }
+
+    //  按照文章大类搜索文章
+    static async searchArticleByClass(classId) {
+        let data = await ArticleclassModel.findOne({ where: { id: classId } });
+        if (data) {
+            let articleList = JSON.parse(data.articleList);
+            let result = await ArticleModel.findAll({ where: { id: articleList, visibleType: { $not: 3 } }, attributes: { exclude: ['content'] } });
+            return result;
+        }
+    }
+
+    //  查询猜你喜欢列表
+    static async searchLikeArticle(req, res, next) {
+        const { error } = schemaSearchLikeArticle.validate(req.body);
+        if (!error) {
+            const { articleId } = req.body;
+            try {
+                let articleData = await ArticleModel.findOne({ where: { id: articleId } });
+                let { articleclassId, tagList } = articleData;
+                let classArticleList = [];
+                let tagArticleList = [];
+                //  取文章大类中的前3项
+                if (articleclassId) {
+                    classArticleList = await ArticleControllers.searchArticleByClass(articleclassId);
+                    classArticleList = classArticleList.slice(0, 3);
+                }
+
+                //  取tag相同的文章
+                if (tagList) {
+                    let _tagListList = JSON.parse(tagList);
+                    let random = Math.floor(Math.random() * _tagListList.length);
+                    let randomTag = _tagListList[random];
+                    tagArticleList = await ArticleModel.findAll({ where: { $or: { tagList: { $like: `%${randomTag}%` } }, visibleType: { $not: 3 } }, attributes: { exclude: ['content'] } });
+                    if (classArticleList.length < 3) {
+                        tagArticleList = tagArticleList.slice(0, 6 - classArticleList.length);
+                    } else {
+                        tagArticleList = tagArticleList.slice(0, 3);
+                    }
+                }
+
+                let resultTotalList = [...classArticleList, ...tagArticleList];
+
+                // 去重相同文章
+                function uniqueObjects(arr, key) {
+                    let seen = new Set();
+                    return arr.filter((item) => {
+                        let hash = JSON.stringify(item[key]);
+                        return seen.has(hash) ? false : seen.add(hash);
+                    });
+                }
+                resultTotalList = uniqueObjects(resultTotalList, 'id').filter((item) => item.id != articleId);
+                packageResponse('success', { data: resultTotalList }, res);
             } catch (err) {
                 packageResponse('error', { errorMessage: err }, res);
             }

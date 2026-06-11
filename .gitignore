@@ -1,1 +1,7 @@
 node_modules
+config/index.js
+logs
+static
+uploads
+.env
+.env.local

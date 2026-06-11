@@ -1,19 +1,17 @@
 const moment = require('moment')
-// article 表
+// code 表
 module.exports = (sequelize, dataTypes) => {
-  const Article = sequelize.define(
-    'article',
+  const Code = sequelize.define(
+    'code',
     {
       id: { type: dataTypes.INTEGER(11), primaryKey: true, autoIncrement: true },
-      author: { type: dataTypes.STRING(50), allowNull: false },
       title: { type: dataTypes.STRING(255), allowNull: false, unique: true },
       content: { type: dataTypes.TEXT },
       viewCount: { type: dataTypes.INTEGER(11), defaultValue: 0 }, // 阅读数
       goodCount: { type: dataTypes.INTEGER(11), defaultValue: 0 }, // 点赞数
       collectionCount: { type: dataTypes.INTEGER(11), defaultValue: 0 }, // 收藏数
-      recommend: { type: dataTypes.INTEGER(11), defaultValue: 0 }, // 热度
+      difficult: { type: dataTypes.INTEGER(11), defaultValue: 5 }, // 难度
       tagList: {type: dataTypes.STRING(255), allowNull: false},
-      articleCover: {type: dataTypes.STRING(255), allowNull: true}, // 文章封面
       visibleType: {
         type: dataTypes.TINYINT,
         defaultValue: 1,
@@ -39,23 +37,15 @@ module.exports = (sequelize, dataTypes) => {
     }
   )
 
-  Article.associate = models => {
-    // Article.hasMany(models.tag)
-    // Article.hasMany(models.category)
-    Article.hasMany(models.comment)
-    Article.hasMany(models.reply)
-
-    Article.belongsTo(models.user, {
-      foreignKey: 'userId',
-      targetKey: 'id',
-      constraints: false
-    });
-    Article.belongsTo(models.articleclass, {
-      foreignKey: 'articleclassId',
-      targetKey: 'id',
-      constraints: false
-    });
+  Code.associate = models => {
+    // Code.hasMany(models.comment)
+    // Code.hasMany(models.reply)
+    // Code.belongsTo(models.articleclass, {
+    //   foreignKey: 'articleclassId',
+    //   targetKey: 'id',
+    //   constraints: false
+    // });
   }
 
-  return Article
+  return Code
 }

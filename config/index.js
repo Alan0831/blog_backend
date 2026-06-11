@@ -1,4 +1,8 @@
+require('dotenv').config()
+
 const devMode = process.env.NODE_ENV === 'development'
+
+const env = process.env
 
 const config = {
   PORT: 6060, // 启动端口
@@ -50,6 +54,12 @@ const config = {
       },
       timezone: '+08:00'
     }
+  },
+  ALIOSS: {
+    accessKeyId: env.ALIBABA_CLOUD_ACCESS_KEY_ID || '',
+    accessKeySecret: env.ALIBABA_CLOUD_ACCESS_KEY_SECRET || '',
+    region: env.ALIOSS_REGION || 'oss-cn-beijing',
+    bucket: env.ALIOSS_BUCKET || 'commit-alan',
   }
 }
 

@@ -38,6 +38,18 @@ module.exports = (sequelize, dataTypes) => {
         targetKey: 'id',
         constraints: false
     });
+    Collection.belongsTo(models.video, {
+      as: 'video',
+      foreignKey: 'videoId',
+      targetKey: 'id',
+      constraints: false
+    });
+    Collection.belongsTo(models.code, {
+      as: 'code',
+      foreignKey: 'codeId',
+      targetKey: 'id',
+      constraints: false
+    });
   }
 
   return Collection
