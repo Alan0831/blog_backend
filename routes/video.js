@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { createVideo, getVideoList, findVideoById, getRecommendVideoList, deleteVideo, editVideo, uploadBigVideo, uploadChunks, mergeChunks, verify } = require('../controllers/video');
+const { createVideo, getVideoList, findVideoById, getRecommendVideoList, deleteVideo, editVideo, uploadBigVideo, uploadChunks, mergeChunks, verify, getVideoProcessStatus } = require('../controllers/video');
 const multer = require('multer');
 const path = require('path');
 const multipart = require("connect-multiparty");
@@ -29,6 +29,7 @@ router.post('/deleteVideo', deleteVideo);
 router.post('/editVideo', editVideo);
 router.post('/mergeChunks', mergeChunks);
 router.post('/verify', verify);
+router.post('/getVideoProcessStatus', getVideoProcessStatus);
 router.post('/uploadBigVideo', upload.single('file'), uploadBigVideo);
 router.post('/uploadChunks', multipartMiddleware, uploadChunks);
 

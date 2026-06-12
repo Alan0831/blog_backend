@@ -19,6 +19,156 @@ const outputDir = path.join(__dirname, `../static/video`); // 切片输出地址
 let scheduleTask = {};
 const SCHEDULE_TIME = '30 1 1 * * *'; // 每天的1点1分30秒
 
+// ffmpeg 是最吃 CPU/内存的步骤，这里把默认并发限制为 1，避免多个大视频同时切片把服务器内存打满。
+const FFMPEG_MAX_CONCURRENT = Math.max(parseInt(process.env.FFMPEG_MAX_CONCURRENT || '1', 10), 1);
+// 每个 ffmpeg 进程内部也限制线程数，默认单线程；如果服务器配置更高，可以通过环境变量 FFMPEG_THREADS 调大。
+const FFMPEG_THREADS = Math.max(parseInt(process.env.FFMPEG_THREADS || '1', 10), 1);
+// HLS 每个 ts 分片的目标时长，默认 3 秒；分片越短首屏和拖动越灵敏，但请求数量也会更多。
+const HLS_SEGMENT_DURATION = Math.max(parseInt(process.env.HLS_SEGMENT_DURATION || '3', 10), 1);
+// 播放端使用的多清晰度配置：低清晰度保证弱网能快速起播，高清晰度保留观感。
+const VIDEO_RENDITIONS = [
+    { name: '360p', height: 360, bandwidth: 1000000, videoBitrate: '800k', maxrate: '1000k', bufsize: '2000k', audioBitrate: '96k' },
+    { name: '720p', height: 720, bandwidth: 3000000, videoBitrate: '2500k', maxrate: '3000k', bufsize: '6000k', audioBitrate: '128k' },
+    { name: '1080p', height: 1080, bandwidth: 5500000, videoBitrate: '4500k', maxrate: '5500k', bufsize: '11000k', audioBitrate: '160k' },
+];
+// 记录当前正在运行的 ffmpeg 数量，配合队列实现“排队切片”。
+let ffmpegActiveCount = 0;
+// 等待执行的 ffmpeg 任务队列；超过并发限制的切片任务会先放在这里。
+const ffmpegQueue = [];
+// 记录视频后台处理状态；进程重启后内存状态会丢失，但可以通过 master.m3u8 是否存在兜底判断成功状态。
+const videoProcessStatus = new Map();
+
+// 统一生成本地 HLS 播放地址，避免不同接口拼出来的路径不一致。
+function getLocalVideoUrl(fragmentName) {
+    return `http://www.alanarmstrong.xyz/videoPath/${fragmentName}/master.m3u8`;
+}
+
+// 根据视频 key 生成本地 master.m3u8 路径；只要该文件存在，就说明多清晰度切片已经真正完成。
+function getMasterPlaylistPath(fragmentName) {
+    return path.resolve(path.join(outputDir, fragmentName, 'master.m3u8'));
+}
+
+// 从本地播放地址里反推出视频 key，createVideo 时用来判断切片是否已经完成。
+function getFragmentNameFromVideoUrl(videoUrl = '') {
+    const matched = String(videoUrl).match(/\/videoPath\/([^/]+)\/master\.m3u8/);
+    return matched ? matched[1] : '';
+}
+
+// 统一写入后台处理状态，方便 mergeChunks、轮询接口和日志使用同一份状态结构。
+function setVideoProcessStatus(fragmentName, status, extra = {}) {
+    videoProcessStatus.set(fragmentName, {
+        fileHash: fragmentName,
+        status,
+        videoUrl: getLocalVideoUrl(fragmentName),
+        updatedAt: new Date().toISOString(),
+        ...extra,
+    });
+}
+
+// 读取后台处理状态；如果内存状态丢了，但 master.m3u8 已存在，也直接返回 success。
+function getVideoProcessStatus(fragmentName) {
+    if (!fragmentName) {
+        return { status: 'unknown', message: '缺少 fileHash' };
+    }
+    if (fs.existsSync(getMasterPlaylistPath(fragmentName))) {
+        return {
+            fileHash: fragmentName,
+            status: 'success',
+            progress: 100,
+            videoUrl: getLocalVideoUrl(fragmentName),
+            message: '视频切片已完成',
+        };
+    }
+    return videoProcessStatus.get(fragmentName) || {
+        fileHash: fragmentName,
+        status: 'unknown',
+        progress: 0,
+        videoUrl: getLocalVideoUrl(fragmentName),
+        message: '未找到后台处理状态，可能需要重新触发合并/切片',
+    };
+}
+
+// 写入 HLS 主播放列表，前端播放器加载 master.m3u8 后会根据网络自动选择 360p/720p/1080p。
+function writeMasterPlaylist(folderPath, renditions) {
+    const content = [
+        '#EXTM3U',
+        '#EXT-X-VERSION:3',
+        ...renditions.flatMap((item) => [
+            `#EXT-X-STREAM-INF:BANDWIDTH=${item.bandwidth}`,
+            `${item.name}/index.m3u8`,
+        ]),
+        '',
+    ].join('\n');
+    fs.writeFileSync(path.join(folderPath, 'master.m3u8'), content);
+}
+
+// 递归收集目录下所有文件，多清晰度 HLS 会产生子目录，定时上传 OSS 时需要递归处理。
+function getFilesRecursive(dir) {
+    return fs.readdirSync(dir, { withFileTypes: true }).reduce((result, item) => {
+        const fullPath = path.join(dir, item.name);
+        if (item.isDirectory()) {
+            result.push(...getFilesRecursive(fullPath));
+        } else {
+            result.push(fullPath);
+        }
+        return result;
+    }, []);
+}
+
+// 读取源视频高度，用于决定是否需要生成 1080p；低分辨率视频不做无意义的放大转码。
+function getVideoHeight(filePath) {
+    return new Promise((resolve) => {
+        ffmpeg.ffprobe(filePath, (err, metadata) => {
+            if (err) {
+                logger.info(`============读取视频元信息失败:${err}，将按默认多清晰度处理============`);
+                return resolve(0);
+            }
+            const stream = (metadata.streams || []).find((item) => item.codec_type === 'video');
+            resolve(stream && stream.height ? stream.height : 0);
+        });
+    });
+}
+
+// 控制 ffmpeg 并发：有空位就立即执行，没有空位就排队，前一个任务结束后自动唤醒下一个。
+function runFfmpegWithLimit(taskName, taskFactory) {
+    return new Promise((resolve, reject) => {
+        const run = () => {
+            ffmpegActiveCount += 1;
+            logger.info(`============ffmpeg任务进入执行:${taskName},当前并发:${ffmpegActiveCount}/${FFMPEG_MAX_CONCURRENT},等待队列:${ffmpegQueue.length}============`);
+
+            Promise.resolve()
+                .then(taskFactory)
+                .then(resolve)
+                .catch(reject)
+                .finally(() => {
+                    ffmpegActiveCount -= 1;
+                    const next = ffmpegQueue.shift();
+                    if (next) next();
+                });
+        };
+
+        if (ffmpegActiveCount < FFMPEG_MAX_CONCURRENT) {
+            run();
+        } else {
+            ffmpegQueue.push(run);
+            logger.info(`============ffmpeg任务排队:${taskName},等待队列:${ffmpegQueue.length}============`);
+        }
+    });
+}
+
+// 使用流式追加合并分片，避免 readFileSync 一次把分片完整读进内存，降低大视频合并时的内存峰值。
+function appendChunkToFile(chunkPath, filePath) {
+    return new Promise((resolve, reject) => {
+        const readStream = fs.createReadStream(chunkPath);
+        const writeStream = fs.createWriteStream(filePath, { flags: 'a' });
+
+        readStream.on('error', reject);
+        writeStream.on('error', reject);
+        writeStream.on('finish', resolve);
+        readStream.pipe(writeStream);
+    });
+}
+
 // 定时任务 处理本地视频文件到阿里云oss
 const task = async function (fileName, folderPath) {
     const videoList = await VideoModel.findAll({ where: { id: { $not: -1 } } });
@@ -37,15 +187,13 @@ const task = async function (fileName, folderPath) {
             }
         }
     }
-    // 拿到需要更新的url更新
-    let id = updatedList[0].id;
-    let ossVideoUrl = updatedList[0].ossVideoUrl;
-    // 完成所有文件的上传，然后删除该文件夹
-    const filesAfterUpload = fs.readdirSync(folderPath);
-    if (filesAfterUpload.length === 0) {
-        fs.rmdirSync(folderPath, { recursive: true });
+    // 拿到需要更新的url更新；如果本轮没有匹配到视频记录，就只停止任务，避免空数组报错。
+    if (updatedList.length > 0) {
+        let id = updatedList[0].id;
+        let ossVideoUrl = updatedList[0].ossVideoUrl;
+        await VideoModel.update({ videoUrl: ossVideoUrl }, { where: { id } });
     }
-    await VideoModel.update({ videoUrl: ossVideoUrl }, { where: { id } });
+    // uploadFragment 已经递归上传并清理本地目录，这里不再重复读取/删除文件夹。
     scheduleTask[fileName] && scheduleTask[fileName].stop();
     delete scheduleTask[fileName];
     logger.info(`============定时任务处理完成============`);
@@ -94,6 +242,10 @@ class VideoControllers {
         if (!error) {
             const { title, content, authorId, visibleType, videoUrl, poster, partition } = req.body;
             const normalizedPartition = normalizePartition(partition);
+            const fragmentName = getFragmentNameFromVideoUrl(videoUrl);
+            if (fragmentName && !fs.existsSync(getMasterPlaylistPath(fragmentName))) {
+                return packageResponse('error', { errorMessage: '视频仍在处理中，请等待切片完成后再发布' }, res);
+            }
             const result = await VideoModel.findOne({ where: { videoUrl } });
             logger.info(`============用户ID:${authorId}上传视频============`);
             if (result) {
@@ -317,11 +469,22 @@ class VideoControllers {
     // 上传大视频(不用)
     static async uploadBigVideo(req, res, next) {
         if (req.file) {
-            let filePath = path.join(__dirname, `../uploads/${req.file.filename}`); // 视频地址
-            let outputDir = path.join(__dirname, `../static/video`); // 切片输出地址
-            let videoUrl = await VideoControllers.videoFragment({ filePath, outputDir, fileName: req.file.filename });
-            logger.info(`============${req.file.filename}视频上传成功============`);
-            packageResponse('success', { data: { ...req.file, videoUrl } }, res);
+            try {
+                let filePath = path.join(__dirname, `../uploads/${req.file.filename}`); // 视频地址
+                let outputDir = path.join(__dirname, `../static/video`); // 切片输出地址
+                // 这里也走统一的 ffmpeg 排队逻辑，避免“大视频直传”和“分片上传”同时切片抢资源。
+                const fragmentName = req.file.filename;
+                const videoUrl = getLocalVideoUrl(fragmentName);
+                setVideoProcessStatus(fragmentName, 'processing', { progress: 1, message: '文件上传完成，等待后台转码切片' });
+                VideoControllers.videoFragment({ filePath, outputDir, fileName: req.file.filename })
+                    .then((url) => logger.info(`============${req.file.filename}后台切片完成,url是:${url}============`))
+                    .catch((err) => logger.info(`============${req.file.filename}后台切片失败:${err && err.err ? err.err : err}============`));
+                logger.info(`============${req.file.filename}视频上传完成，后台开始切片============`);
+                packageResponse('success', { data: { ...req.file, videoUrl, fileHash: fragmentName, processStatus: 'processing' } }, res);
+            } catch (err) {
+                logger.info(`============${req.file.filename}视频上传失败:${err}============`);
+                packageResponse('error', { errorMessage: '上传视频失败: ' + err }, res);
+            }
         } else {
             packageResponse('error', { errorMessage: '上传视频失败' }, res);
         }
@@ -364,32 +527,46 @@ class VideoControllers {
         // 读取临时文件夹获得的文件（分片）名称数组可能乱序，需要重新排序
         chunkPaths.sort((a, b) => a.split("-")[1] - b.split("-")[1]);
 
-        // 遍历文件（分片）数组，将分片追加到文件中
-        const pool = chunkPaths.map(
-            (chunkName) =>
-                new Promise((resolve) => {
-                    const chunkPath = path.resolve(chunkDir, chunkName);
-                    // 将分片追加到文件中
-                    fs.appendFileSync(filePath, fs.readFileSync(chunkPath));
-                    // 删除分片
-                    fs.unlinkSync(chunkPath);
-                    resolve();
-                })
-        );
         try {
-            await Promise.all(pool);
+            // 遍历文件（分片）数组，将分片追加到文件中
+            for (const chunkName of chunkPaths) {
+                const chunkPath = path.resolve(chunkDir, chunkName);
+                // 将分片追加到文件中；这里使用流式写入，避免大分片一次性进入内存。
+                await appendChunkToFile(chunkPath, filePath);
+                // 删除分片；只有当前分片成功写入后才删除，避免合并失败时误删未写入的数据。
+                fs.unlinkSync(chunkPath);
+            }
             // 等待所有分片追加到文件后，删除临时文件夹
             fs.rmdirSync(chunkDir);
             logger.info(`============分片追加完毕,删除临时文件夹${chunkDir}============`);
             console.log(filePath)
-            let videoUrl = await VideoControllers.videoFragment({ filePath, outputDir, fileName: fileName, userId });
+            const videoUrl = getLocalVideoUrl(fileHash);
+            // 合并完成后立即进入后台切片，不再让 HTTP 请求一直等待 ffmpeg，避免大视频导致接口超时。
+            setVideoProcessStatus(fileHash, 'processing', { progress: 1, message: '分片合并完成，等待后台转码切片' });
+            VideoControllers.videoFragment({ filePath, outputDir, fileName: fileName, fileHash, userId })
+                .then((url) => {
+                    logger.info(`============视频${fileHash}后台切片完成,url是:${url}============`);
+                })
+                .catch((err) => {
+                    logger.info(`============视频${fileHash}后台切片失败:${err && err.err ? err.err : err}============`);
+                });
             console.log('url是==========' + videoUrl);
 
-            packageResponse('success', { successMessage: '文件上传成功', data: { videoUrl} }, res);
+            packageResponse('success', {
+                successMessage: '文件合并成功，视频正在后台转码切片',
+                data: { videoUrl, fileHash, processStatus: 'processing' }
+            }, res);
         } catch (error) {
             console.log(error);
             packageResponse('error', { errorMessage: '文件上传失败！' }, res);
         }
+    }
+
+    // 查询视频转码/切片状态，前端在 mergeChunks 返回 processing 后轮询这个接口。
+    static async getVideoProcessStatus(req, res, next) {
+        const { fileHash, videoUrl } = req.body;
+        const fragmentName = fileHash || getFragmentNameFromVideoUrl(videoUrl);
+        packageResponse('success', { data: getVideoProcessStatus(fragmentName) }, res);
     }
 
     // 校验分片是否存在
@@ -407,7 +584,12 @@ class VideoControllers {
         }
         if (existFile) {
             logger.info(`============${chunkDir}视频已存在============`);
-            packageResponse('success', { successMessage: '文件已存在', data: { existFile, existChunks, videoUrl: `http://commit-alan.oss-cn-beijing.aliyuncs.com/videos/${fileName}/${fileName}.m3u8` } }, res);
+            // 分片合并后的切片目录使用 fileHash 命名，所以秒传/重试时也返回 hash 版本的本地播放地址。
+            const processInfo = getVideoProcessStatus(fileHash);
+            packageResponse('success', {
+                successMessage: '文件已存在',
+                data: { existFile, existChunks, videoUrl: getLocalVideoUrl(fileHash), processStatus: processInfo.status, processInfo }
+            }, res);
         } else {
             logger.info(`============${chunkDir}视频不存在============`);
             packageResponse('success', { successMessage: '文件不存在', data: { existFile, existChunks } }, res);
@@ -425,9 +607,23 @@ class VideoControllers {
     * @returns
      */
     static videoFragment(options = {}) {
-        const { filePath, outputDir, fileName, duration = 5, userId } = options;
-        return new Promise((resolve, reject) => {
-            const folderPath = path.resolve(path.join(outputDir, fileName));
+        const { filePath, outputDir, fileHash, fileName, duration = HLS_SEGMENT_DURATION, userId } = options;
+        // fileHash 优先用于目录名，避免中文文件名、括号等特殊字符在 Linux/nginx/ffmpeg 中产生路径兼容问题。
+        const fragmentName = fileHash || fileName;
+        const taskName = fileName || fragmentName;
+
+        return runFfmpegWithLimit(taskName, async () => {
+            const inputPath = path.resolve(path.join(filePath));
+            const folderPath = path.resolve(path.join(outputDir, fragmentName));
+            const videoUrl = getLocalVideoUrl(fragmentName);
+
+            // 切片前先确认合并后的源文件存在，避免 ffmpeg 启动后才报一个难读的路径错误。
+            if (!fs.existsSync(inputPath)) {
+                const err = new Error(`源视频文件不存在:${inputPath}`);
+                setVideoProcessStatus(fragmentName, 'failed', { progress: 0, message: err.message });
+                throw err;
+            }
+
             // 确保目录存在
             if (!fs.existsSync(folderPath)) {
                 fs.mkdirSync(folderPath, { recursive: true });
@@ -435,53 +631,146 @@ class VideoControllers {
             } else {
                 console.log(`${folderPath}已存在`);
             }
+
+            const timeStart = new Date().getTime();
+            const masterItems = [];
+            const sourceHeight = await getVideoHeight(inputPath);
+            // 根据源视频高度筛选输出档位，避免 720p 源视频再生成 1080p 这种浪费空间和时间的结果。
+            let renditions = sourceHeight ? VIDEO_RENDITIONS.filter((item) => item.height <= sourceHeight) : VIDEO_RENDITIONS;
+            if (renditions.length === 0) {
+                // 极小分辨率视频至少生成一档 360p，保证前端始终能拿到可播放的 master.m3u8。
+                renditions = [VIDEO_RENDITIONS[0]];
+            }
+            setVideoProcessStatus(fragmentName, 'processing', { progress: 5, message: '开始生成多清晰度播放文件', sourceHeight });
+
+            try {
+                for (let i = 0; i < renditions.length; i++) {
+                    const rendition = renditions[i];
+                    const baseProgress = Math.round((i / renditions.length) * 90) + 5;
+                    const nextProgress = Math.round(((i + 1) / renditions.length) * 90) + 5;
+                    setVideoProcessStatus(fragmentName, 'processing', {
+                        progress: baseProgress,
+                        currentQuality: rendition.name,
+                        message: `正在生成${rendition.name}播放文件`,
+                    });
+
+                    const result = await VideoControllers.transcodeHlsRendition({
+                        inputPath,
+                        folderPath,
+                        fragmentName,
+                        rendition,
+                        duration,
+                    });
+                    masterItems.push(result);
+                    setVideoProcessStatus(fragmentName, 'processing', {
+                        progress: nextProgress,
+                        currentQuality: rendition.name,
+                        message: `${rendition.name}播放文件生成完成`,
+                    });
+                }
+
+                writeMasterPlaylist(folderPath, masterItems);
+                const timeEnd = new Date().getTime();
+                let time1 = (timeEnd - timeStart) / 1000;
+                logger.info(`============视频${fragmentName}多清晰度切片成功,共耗时${time1}秒============`);
+                setVideoProcessStatus(fragmentName, 'success', { progress: 100, message: '视频转码切片完成' });
+
+                if (!scheduleTask[fragmentName]) {
+                    scheduleTask[fragmentName] = new TaskScheduler(SCHEDULE_TIME, () => task(fragmentName, folderPath, userId));
+                    scheduleTask[fragmentName].start();
+                    logger.info(`============启动定时任务============`);
+                }
+
+                return videoUrl;
+            } catch (err) {
+                const errorMessage = err && err.err
+                    ? (err.err.message || String(err.err))
+                    : (err && err.message ? err.message : String(err));
+                setVideoProcessStatus(fragmentName, 'failed', {
+                    progress: 0,
+                    message: '视频转码切片失败',
+                    errorMessage,
+                });
+                throw err;
+            }
+        });
+    }
+
+    // 生成单个清晰度的 HLS 播放列表和 ts 分片；外层已经限制并发，这里每个清晰度按顺序执行。
+    static transcodeHlsRendition(options = {}) {
+        const { inputPath, folderPath, fragmentName, rendition, duration } = options;
+        return new Promise((resolve, reject) => {
+            const renditionDir = path.join(folderPath, rendition.name);
+            const segmentPath = path.join(renditionDir, `${rendition.name}_%05d.ts`);
+            const m3u8Path = path.join(renditionDir, 'index.m3u8');
             let timeStart = '';
-            let timeEnd = '';
+            let lastProgressLogTime = 0;
+
+            // 每个清晰度独立目录，方便播放器按相对路径加载，也方便之后递归上传到 OSS。
+            if (!fs.existsSync(renditionDir)) {
+                fs.mkdirSync(renditionDir, { recursive: true });
+            }
 
             ffmpeg()
-                .input(path.resolve(path.join(filePath)))
-                // .videoCodec('libx264') // 设置视频编解码器
-                // .audioCodec('libfaac') // 设置 音频解码器
-                // .format('hls') // 输出视频格式
-                // .outputOptions('-hls_list_size 0') //  -hls_list_size n:设置播放列表保存的最多条目，设置为0会保存有所片信息，默认值为5
-                // .outputOption('-hls_time 5') // -hls_time n: 设置每片的长度，默认值为2。单位为秒
-                .outputOptions([
-                    "-hls_list_size 0",
-                    "-start_number 0",
-                    "-movflags +faststart",    // 启用faststart以提供更好的流体体验
-                    `-hls_time ${duration}`,
-                    "-hls_segment_filename",
-                ])
-                .output(`${path.join(outputDir)}/${fileName}/${fileName}_%02d.ts`)
-                .output(`${path.join(outputDir)}/${fileName}/${fileName}.m3u8`)
-                .on("start", () => {
-                    console.log('开发切片 ===>>>', fileName);
-                    // 准备完成直接回调 用来快速反应前端
-                    resolve(`http://www.alanarmstrong.xyz/videoPath/${fileName}/${fileName}.m3u8`);
+                .input(inputPath)
+                .format('hls')
+                .outputOptions(
+                    "-y", // 允许重试时覆盖同名清晰度文件。
+                    "-threads", String(FFMPEG_THREADS), // 限制单个 ffmpeg 进程线程数，降低 CPU/内存瞬时占用。
+                    "-c:v", "libx264", // 生成网页播放版视频，主动降低码率，解决每个 ts 几十 MB 的问题。
+                    "-preset", "veryfast", // 在画质和转码速度之间取一个偏快的平衡，避免服务器长期满载。
+                    "-crf", "24", // CRF 越大体积越小；24 对博客视频通常比较省流量。
+                    "-b:v", rendition.videoBitrate,
+                    "-maxrate", rendition.maxrate, // 限制峰值码率，避免某些复杂画面产生超大 ts。
+                    "-bufsize", rendition.bufsize,
+                    "-vf", `scale=-2:${rendition.height}`, // 按目标高度缩放，宽度自动取偶数，保证 H.264 兼容。
+                    "-profile:v", "main",
+                    "-pix_fmt", "yuv420p", // 兼容大多数浏览器和移动设备。
+                    "-c:a", "aac",
+                    "-b:a", rendition.audioBitrate,
+                    "-ac", "2",
+                    "-sn", // 不处理字幕流，减少不必要的流映射和内存占用。
+                    "-hls_list_size", "0",
+                    "-hls_playlist_type", "vod",
+                    "-hls_time", String(duration),
+                    "-force_key_frames", `expr:gte(t,n_forced*${duration})`, // 强制关键帧对齐切片边界，减少播放器拖动卡顿。
+                    "-sc_threshold", "0",
+                    "-start_number", "0",
+                    "-max_muxing_queue_size", "512",
+                    "-hls_segment_filename", segmentPath,
+                )
+                .output(m3u8Path)
+                .on("start", (commandLine) => {
                     timeStart = new Date().getTime();
-                    logger.info(`============视频${fileName}开始切片============`);
+                    logger.info(`============视频${fragmentName}-${rendition.name}开始转码切片,ffmpeg命令:${commandLine}============`);
                 })
                 // 监听切片进度
                 .on("progress", (data) => {
-
+                    const now = Date.now();
+                    // 进度日志做节流，最多约 10 秒打一条，避免大视频刷爆日志文件。
+                    if (now - lastProgressLogTime > 10000) {
+                        lastProgressLogTime = now;
+                        logger.info(`============视频${fragmentName}-${rendition.name}切片中,进度:${data.percent || 0}%,时间点:${data.timemark || ''}============`);
+                    }
                 })
-                .on("error", (err) => {
-                    logger.info(`============视频${fileName}切片失败:${err}============`);
+                .on("error", (err, stdout, stderr) => {
+                    // SIGKILL/内存不足/格式不兼容等问题通常会进入这里；把 stderr 记录下来，后续排查比单看 err 更有信息量。
+                    logger.info(`============视频${fragmentName}-${rendition.name}切片失败:${err},stderr:${stderr || ''}============`);
                     reject({
-                        fileName,
+                        fileHash: fragmentName,
+                        rendition: rendition.name,
                         err,
+                        stderr,
                     });
                 })
                 .on("end", async () => {
-                    console.log(`切片结束 ===>>>`, fileName);
-                    timeEnd = new Date().getTime();
+                    const timeEnd = new Date().getTime();
                     let time1 = (timeEnd - timeStart) / 1000;
-                    logger.info(`============视频${fileName}切片成功,共耗时${time1}秒============`);
-                    if (!scheduleTask[fileName]) {
-                        scheduleTask[fileName] = new TaskScheduler(SCHEDULE_TIME, () => task(fileName, folderPath, userId));
-                        scheduleTask[fileName].start();
-                        logger.info(`============启动定时任务============`);
-                    }
+                    logger.info(`============视频${fragmentName}-${rendition.name}切片成功,共耗时${time1}秒============`);
+                    resolve({
+                        name: rendition.name,
+                        bandwidth: rendition.bandwidth,
+                    });
                 })
                 .run();
         });
@@ -491,22 +780,25 @@ class VideoControllers {
     static async uploadFragment(fileName, cb, failcb) {
         const _timeStart = new Date().getTime();
         const folderPath = path.resolve(path.join(__dirname, `../static/video/${fileName}`));
-        const files = fs.readdirSync(folderPath);
+        const files = getFilesRecursive(folderPath);
         let videoUrl = '';
         logger.info(`============开始上传${fileName}视频文件至阿里云============`);
         for (let i = 0; i < files.length; i++) {
-            const file = files[i];
-            const filePath = path.join(folderPath, file);
-            const ossPath = `videos/${fileName}/${file}`;
+            const filePath = files[i];
+            // 多清晰度 HLS 会有 360p/720p/1080p 子目录，OSS 路径需要保留相对目录结构。
+            const relativePath = path.relative(folderPath, filePath).split(path.sep).join('/');
+            const ossPath = `videos/${fileName}/${relativePath}`;
             const result = await VideoControllers.uploadToOSS(ossPath, filePath);
             logger.info(`============视频${filePath}上传阿里云OSS成功============`);
             // 如果上传成功，则删除本地文件
             if (result) {
-                result.includes('m3u8') && (videoUrl = result);
+                relativePath === 'master.m3u8' && (videoUrl = result);
                 logger.info(`============删除本地文件夹${filePath}成功============`);
                 fs.unlinkSync(filePath);
             }
         }
+        // 所有文件上传后清理空目录，避免多清晰度子目录长期堆积。
+        fs.rmSync(folderPath, { recursive: true, force: true });
         const _timeEnd = new Date().getTime();
         let time2 = (_timeEnd - _timeStart) / 1000;
         logger.info(`============${fileName}视频上传阿里云成功,共耗时${time2}秒,url是:${videoUrl}============`);
