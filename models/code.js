@@ -12,6 +12,7 @@ module.exports = (sequelize, dataTypes) => {
       collectionCount: { type: dataTypes.INTEGER(11), defaultValue: 0 }, // 收藏数
       difficult: { type: dataTypes.INTEGER(11), defaultValue: 5 }, // 难度
       tagList: {type: dataTypes.STRING(255), allowNull: false},
+      partition: { type: dataTypes.STRING(20), allowNull: false, defaultValue: 'codeStudy' },
       visibleType: {
         type: dataTypes.TINYINT,
         defaultValue: 1,

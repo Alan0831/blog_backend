@@ -5,6 +5,7 @@ const { v4: uuidv4 } = require('uuid');
 const { find } = require('../controllers/user');
 const { findIsCollection } = require('../controllers/collection');
 const { logger } = require('../middlewares/logger');
+const { DEFAULT_PARTITION, getPartitionWhere } = require('../utils/partition');
 
 const schemaSearchCodeTopic = joi.object({
     id: joi.number().required(),
@@ -17,6 +18,7 @@ const schemaCreateCodeTopic = joi.object({
     content: joi.string().required(),
     tagList: joi.array().required(),
     difficult: joi.number().required(),
+    partition: joi.string(),
 });
 
 const schemaSubmitMyCode = joi.object({
@@ -44,13 +46,14 @@ const schemaSearchAnswer = joi.object({
 class CodeControllers {
     //  获取代码题目列表
     static async getCodeTopicList(req, res, next) {
-        const { pageNum = 1, pageSize = 10, preview = 1, keyword = '' } = req.body;
+        const { pageNum = 1, pageSize = 10, preview = 1, keyword = '', partition } = req.body;
         let codeOrder = [['createdAt', 'DESC']];
         logger.info(`============用户开始请求代码题目列表============`);
         const findParam = {
             where: {
                 id: { $not: -1 },   // 过滤关于页面的副本
                 visibleType: { $not: 3 },
+                ...getPartitionWhere(partition),
                 $or: {
                     title: {
                         $like: `%${keyword}%`
@@ -153,7 +156,7 @@ class CodeControllers {
                     // const categories = categoryList.map(c => ({ name: c }))
                     const uuid = uuidv4().toString().replace(/-/g, '');
                     const data = await CodeModel.create(
-                        { title, content, tagList: JSON.stringify(tags), difficult },
+                        { title, content, tagList: JSON.stringify(tags), difficult, partition: DEFAULT_PARTITION },
                     )
 
                     packageResponse('success', { data, successMessage: '创建题目成功' }, res);

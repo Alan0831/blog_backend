@@ -4,6 +4,7 @@ const joi = require('joi');
 const { find } = require('../controllers/user');
 const { logger } = require('../middlewares/logger');
 const { findIsCollection } = require('../controllers/collection');
+const { normalizePartition, getPartitionWhere } = require('../utils/partition');
 const OSS = require('ali-oss');
 const { ALIOSS } = require('../config');
 const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
@@ -65,6 +66,7 @@ const schemaCreateVideo = joi.object({
     content: joi.string().required(),
     poster: joi.string().allow(null, ''),
     visibleType: joi.number(),
+    partition: joi.string().allow(null, ''),
 });
 const schemaSearchVideo = joi.object({
     id: joi.number().required(),
@@ -81,6 +83,7 @@ const schemaEditVideo = joi.object({
     content: joi.string().required(),
     poster: joi.string().allow(null, ''),
     visibleType: joi.number(),
+    partition: joi.string().allow(null, ''),
 });
 
 class VideoControllers {
@@ -89,7 +92,8 @@ class VideoControllers {
         const { error } = schemaCreateVideo.validate(req.body);
 
         if (!error) {
-            const { title, content, authorId, visibleType, videoUrl, poster } = req.body;
+            const { title, content, authorId, visibleType, videoUrl, poster, partition } = req.body;
+            const normalizedPartition = normalizePartition(partition);
             const result = await VideoModel.findOne({ where: { videoUrl } });
             logger.info(`============用户ID:${authorId}上传视频============`);
             if (result) {
@@ -101,7 +105,7 @@ class VideoControllers {
 
                     if (authorData) {
                         const data = await VideoModel.create(
-                            { title, content, poster, visibleType, videoUrl, author: authorData.username, userId: authorId },
+                            { title, content, poster, visibleType, videoUrl, partition: normalizedPartition, author: authorData.username, userId: authorId },
                         )
                         // 记录到朋友圈
                         FriendCircleModel.create({ userId: authorId, videoId: data.id, type: 2 });
@@ -122,7 +126,8 @@ class VideoControllers {
 
     // 获取视频列表
     static async getVideoList(req, res, next) {
-        const { pageNum = 1, pageSize = 10, keyword = '', userId = '' } = req.body;
+        const { pageNum = 1, pageSize = 10, keyword = '', userId = '', partition } = req.body;
+        const partitionWhere = getPartitionWhere(partition);
         let localIP = req?.socket?.remoteAddress || '';
         let videoOrder = [['createdAt', 'DESC']];
         let findParam = {};
@@ -134,7 +139,8 @@ class VideoControllers {
             let author = authorData.username;
             findParam = {
                 where: {
-                    author
+                    author,
+                    ...partitionWhere,
                 },
                 include: [
                     {
@@ -154,6 +160,7 @@ class VideoControllers {
                 where: {
                     id: { $not: -1 },   // 过滤关于页面的副本
                     visibleType: { $not: 3 },
+                    ...partitionWhere,
                     $or: {
                         title: {
                             $like: `%${keyword}%`
@@ -191,9 +198,10 @@ class VideoControllers {
 
     //   获取推荐视频列表
     static async getRecommendVideoList(req, res, next) {
+        const { partition } = req.body;
         let videoOrder = [['recommend', 'DESC']];
         let findParam = {
-            where: { visibleType: { $not: 3 } },
+            where: { visibleType: { $not: 3 }, ...getPartitionWhere(partition) },
             attributes: { exclude: ['content'] },
             limit: 6,
             order: videoOrder,
@@ -244,7 +252,7 @@ class VideoControllers {
             if (data) {
                 // 更新点击数和热度
                 VideoModel.update({ viewCount: ++data.viewCount, recommend: ++data.recommend }, { where: { id } });
-                let _data = { ...data.dataValues, isCollected };
+                let _data = { ...data.dataValues, isCollected, partition: normalizePartition(data.partition) };
                 packageResponse('success', { data: _data }, res);
             } else {
                 packageResponse('error', { errorMessage: '该视频已不存在！' }, res);
@@ -256,10 +264,14 @@ class VideoControllers {
     static async editVideo(req, res, next) {
         const { error } = schemaEditVideo.validate(req.body);
         if (!error) {
-            const { videoId, title, content, visibleType, authorId, poster, videoUrl } = req.body;
+            const { videoId, title, content, visibleType, authorId, poster, videoUrl, partition } = req.body;
             try {
                 // const tags = tagList || [];
-                await VideoModel.update({ title, content, visibleType, poster, videoUrl }, { where: { id: videoId } });
+                const updateData = { title, content, visibleType, poster, videoUrl };
+                if (Object.prototype.hasOwnProperty.call(req.body, 'partition')) {
+                    updateData.partition = normalizePartition(partition);
+                }
+                await VideoModel.update(updateData, { where: { id: videoId } });
 
                 //  如果设置了加锁，则更新密码
                 // if (visibleType === 2) {

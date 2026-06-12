@@ -4,8 +4,6 @@ const { logger } = require('../middlewares/logger');
 
 const {
   article: ArticleModel,
-  //   tag: TagModel,
-  //   category: CategoryModel,
   comment: CommentModel,
   reply: ReplyModel,
   user: UserModel,
@@ -13,59 +11,157 @@ const {
   videocomment: VideoCommentModel,
   videoreply: VideoReplyModel,
   video: VideoModel,
-  //   ip: IpModel,
-  sequelize
 } = require('../models')
+
+const userAttributes = { exclude: ['updatedAt', 'password'] };
 
 const schemaCreateComment = joi.object({
   articleId: joi.number(),
-  userId: joi.number().required(),
+  userId: joi.number(),
   content: joi.string().required(),
   commentId: joi.number(),
   type: joi.number().required(),
   replyTo: joi.number(),
 });
+
 const schemaCreateVideoComment = joi.object({
   videoId: joi.number(),
-  userId: joi.number().required(),
+  userId: joi.number(),
   content: joi.string().required(),
   commentId: joi.number(),
   type: joi.number().required(),
   replyTo: joi.number(),
 });
+
 const schemaDeleteComment = joi.object({
   commentId: joi.number(),
   replyId: joi.number(),
   type: joi.number().required(),
 });
+
 const schemaSearchNotice = joi.object({
   userId: joi.number().required(),
 });
+
 const schemaUpdateNotice = joi.object({
   id: joi.number().required(),
 });
 
-/**
- * 邮件通知
- * userId - 添加评论的用户id
- */
-async function sendingEmail(articleId, commentList, commentId, userId) {
-  const article = await ArticleModel.findOne({ where: { id: articleId }, attributes: ['id', 'title'] })
-  const target = commentList.rows.find(d => d.id === parseInt(commentId))
+const schemaGetComments = joi.object({
+  targetType: joi.string().valid('article', 'video').required(),
+  targetId: joi.number().required(),
+  pageNum: joi.number().min(1).default(1),
+  pageSize: joi.number().min(1).max(100).default(20),
+});
 
-  const { emailList, html } = getEmailData(article, target, userId)
+function getActor(req) {
+  const user = req.user || {};
+  return {
+    userId: user.userId || user.id,
+    role: user.role,
+    username: user.username,
+  };
+}
 
-  Promise.all(emailList.map(receiver => sendEmail({ receiver, html })))
-    .then(res => {
-      console.log('success to send email')
-    })
-    .catch(e => {
-      console.log('fail to send email')
-    })
+function canDelete(actor, ownerId) {
+  return actor.role === 1 || Number(actor.userId) === Number(ownerId);
+}
+
+function normalizeUser(user) {
+  if (!user) return null;
+  const data = user.dataValues || user;
+  return {
+    id: data.id,
+    username: data.username,
+    email: data.email,
+    description: data.description,
+    role: data.role,
+    gender: data.gender,
+    github: data.github,
+    disabledDiscuss: data.disabledDiscuss,
+    createdAt: data.createdAt,
+  };
+}
+
+function normalizeReply(reply) {
+  const data = reply.dataValues || reply;
+  return {
+    id: data.id,
+    content: data.content,
+    createdAt: data.createdAt,
+    user: normalizeUser(data.user),
+    replyTo: data.replyTo || null,
+    replyUser: data.replyUser || '',
+  };
+}
+
+function normalizeComment(comment, targetType) {
+  const data = comment.dataValues || comment;
+  const sourceReplies = targetType === 'video' ? data.videoreplies : data.replies;
+  return {
+    id: data.id,
+    content: data.content,
+    createdAt: data.createdAt,
+    user: normalizeUser(data.user),
+    replyTo: null,
+    replyUser: '',
+    replies: (sourceReplies || []).map(normalizeReply),
+  };
+}
+
+function validateCommentContent(content, type) {
+  const value = String(content || '').trim();
+  if (!value) {
+    return { errorCode: 'COMMENT_EMPTY', errorMessage: '评论内容不能为空' };
+  }
+
+  const maxLength = type === 1 ? 500 : 300;
+  if (value.length > maxLength) {
+    return { errorCode: 'COMMENT_TOO_LONG', errorMessage: `评论内容不能超过${maxLength}字` };
+  }
+
+  return { value };
+}
+
+function sendError(res, errorCode, errorMessage, status = 400) {
+  res.status(status);
+  packageResponse('error', { errorCode, errorMessage }, res);
+}
+
+async function findComments(targetType, targetId, pageNum = 1, pageSize = 20) {
+  const isVideo = targetType === 'video';
+  const Comment = isVideo ? VideoCommentModel : CommentModel;
+  const Reply = isVideo ? VideoReplyModel : ReplyModel;
+  const where = isVideo ? { videoId: targetId } : { articleId: targetId };
+
+  const data = await Comment.findAndCountAll({
+    where,
+    attributes: ['id', 'content', 'createdAt'],
+    include: [
+      {
+        model: Reply,
+        attributes: ['id', 'content', 'createdAt', 'replyTo', 'replyUser'],
+        include: [{ model: UserModel, as: 'user', attributes: userAttributes }],
+      },
+      { model: UserModel, as: 'user', attributes: userAttributes },
+    ],
+    offset: (pageNum - 1) * pageSize,
+    limit: parseInt(pageSize),
+    order: [['createdAt', 'DESC'], [Reply, 'createdAt', 'ASC']],
+    distinct: true,
+  });
+
+  const comments = data.rows.map(comment => normalizeComment(comment, targetType));
+  return {
+    count: data.count,
+    rows: comments,
+    comments,
+    pageNum: Number(pageNum),
+    pageSize: Number(pageSize),
+  };
 }
 
 class DiscussController {
-  // 查找文章评论
   static find(params) {
     return ArticleModel.findOne({
       where: params,
@@ -77,20 +173,19 @@ class DiscussController {
           include: [
             {
               model: ReplyModel,
-              attributes: ['id', 'content', 'createdAt', 'replyUser'],
-              include: [{ model: UserModel, as: 'user', attributes: { exclude: ['updatedAt', 'password'] } }],
+              attributes: ['id', 'content', 'createdAt', 'replyTo', 'replyUser'],
+              include: [{ model: UserModel, as: 'user', attributes: userAttributes }],
             },
-            { model: UserModel, as: 'user', attributes: { exclude: ['updatedAt', 'password'] } },
+            { model: UserModel, as: 'user', attributes: userAttributes },
           ],
           row: true,
         },
       ],
-      order: [[CommentModel, 'createdAt', 'DESC'], [[CommentModel, ReplyModel, 'createdAt', 'ASC']]], // comment model order
+      order: [[CommentModel, 'createdAt', 'DESC'], [[CommentModel, ReplyModel, 'createdAt', 'ASC']]],
       row: true,
     });
   }
 
-  // 查找视频评论
   static findVideo(params) {
     return VideoModel.findOne({
       where: params,
@@ -102,193 +197,228 @@ class DiscussController {
           include: [
             {
               model: VideoReplyModel,
-              attributes: ['id', 'content', 'createdAt', 'replyUser'],
-              include: [{ model: UserModel, as: 'user', attributes: { exclude: ['updatedAt', 'password'] } }],
+              attributes: ['id', 'content', 'createdAt', 'replyTo', 'replyUser'],
+              include: [{ model: UserModel, as: 'user', attributes: userAttributes }],
             },
-            { model: UserModel, as: 'user', attributes: { exclude: ['updatedAt', 'password'] } },
+            { model: UserModel, as: 'user', attributes: userAttributes },
           ],
           row: true,
         },
       ],
-      order: [[VideoCommentModel, 'createdAt', 'DESC'], [[VideoCommentModel, VideoReplyModel, 'createdAt', 'ASC']]], // comment model order
+      order: [[VideoCommentModel, 'createdAt', 'DESC'], [[VideoCommentModel, VideoReplyModel, 'createdAt', 'ASC']]],
       row: true,
     });
   }
 
-  // 新增文章评论/回复
+  static async getComments(req, res, next) {
+    const params = { ...req.query, ...req.body };
+    const { error, value } = schemaGetComments.validate(params);
+    if (error) {
+      return sendError(res, 'COMMENT_QUERY_INVALID', '评论查询参数错误');
+    }
+
+    try {
+      const data = await findComments(value.targetType, value.targetId, value.pageNum, value.pageSize);
+      packageResponse('success', { data }, res);
+    } catch (err) {
+      packageResponse('error', { errorCode: 'COMMENT_QUERY_FAILED', errorMessage: '查询评论失败: ' + err }, res);
+    }
+  }
+
   static async createComment(req, res, next) {
     const { error } = schemaCreateComment.validate(req.body);
-    if (!error) {
-      const { articleId, userId, content, commentId, type, replyTo } = req.body;
+    if (error) {
+      return sendError(res, 'COMMENT_PARAM_INVALID', '评论参数错误');
+    }
+
+    const actor = getActor(req);
+    const { articleId, commentId, type, replyTo } = req.body;
+    const validated = validateCommentContent(req.body.content, type);
+    if (validated.errorCode) {
+      return sendError(res, validated.errorCode, validated.errorMessage);
+    }
+
+    try {
+      const userId = actor.userId || req.body.userId;
+      if (!userId) return sendError(res, 'AUTH_REQUIRED', '请先登录', 401);
+
       if (type === 1) {
-        // 添加评论
-        try {
-          await CommentModel.create({ userId, articleId, content });
-          let commentData = await DiscussController.find({ id: articleId });  // 该评论详情
-          let commentUserData = await UserModel.findOne({ where: { id: userId } }); // 评论人详情
-          let articleData = await ArticleModel.findOne({ where: { id: articleId } }); // 评论的文章详情
-          if (articleData.userId != userId) {
-            // 新建提醒
-            await NotificationModel.create({
-              from: userId,
-              fromName: commentUserData.username,
-              toName: articleData.author,
-              content,
-              articleId,
-            });
-          }
-          logger.info(`============用户:${userId}对文章${articleId}评论成功============`);
-          packageResponse('success', { data: commentData, successMessage: '评论成功' }, res);
-        } catch (err) {
-          logger.info(`============用户:${userId}对文章${articleId}评论失败:${err}============`);
-          packageResponse('error', { errorMessage: '评论失败：' + err }, res);
+        await CommentModel.create({ userId, articleId, content: validated.value });
+        const commentUserData = await UserModel.findOne({ where: { id: userId } });
+        const articleData = await ArticleModel.findOne({ where: { id: articleId } });
+        if (articleData && commentUserData && articleData.userId != userId) {
+          await NotificationModel.create({
+            from: userId,
+            fromName: commentUserData.username,
+            toName: articleData.author,
+            content: validated.value,
+            articleId,
+          });
         }
       } else {
-        // 添加回复
-        try {
-          let commentUserData = await UserModel.findOne({ where: { id: userId } }); // 评论人详情
-          let replyToUserData = await UserModel.findOne({ where: { id: replyTo } }); // 被回复人详情
-          let articleData = await ArticleModel.findOne({ where: { id: articleId } }); // 评论的文章详情
-          await ReplyModel.create({ userId, articleId, content, commentId, replyTo, replyUser: replyToUserData.username });
-          let commentData = await DiscussController.find({ id: articleId });
-          if (replyToUserData.id != userId && articleData.userId != userId) {
-            // 新建提醒
-            await NotificationModel.create({
-              from: userId,
-              fromName: commentUserData.username,
-              toName: replyToUserData.username,
-              content,
-              articleId,
-            });
-          }
-          logger.info(`============用户:${commentUserData.username}对用户${replyToUserData.username}回复成功============`);
-          packageResponse('success', { data: commentData, successMessage: '回复成功' }, res);
-        } catch (err) {
-          console.log(err);
-          logger.info(`============用户:${commentUserData.username}对用户${replyToUserData.username}回复失败:${err}============`);
-          packageResponse('error', { errorMessage: '回复失败：' + err }, res);
+        const commentUserData = await UserModel.findOne({ where: { id: userId } });
+        const replyToUserData = await UserModel.findOne({ where: { id: replyTo } });
+        const articleData = await ArticleModel.findOne({ where: { id: articleId } });
+        await ReplyModel.create({
+          userId,
+          articleId,
+          content: validated.value,
+          commentId,
+          replyTo,
+          replyUser: replyToUserData ? replyToUserData.username : '',
+        });
+        if (replyToUserData && articleData && commentUserData && replyToUserData.id != userId && articleData.userId != userId) {
+          await NotificationModel.create({
+            from: userId,
+            fromName: commentUserData.username,
+            toName: replyToUserData.username,
+            content: validated.value,
+            articleId,
+          });
         }
       }
-      // 评论和回复都会加热度
-      const data = await ArticleModel.findOne({ where: { id: articleId } });
-      ArticleModel.update({ recommend: ++data.recommend }, { where: { id: articleId } });
 
-    } else {
-      packageResponse('error', { errorMessage: '评论失败:' + error }, res);
+      const article = await ArticleModel.findOne({ where: { id: articleId } });
+      if (article) ArticleModel.update({ recommend: article.recommend + 1 }, { where: { id: articleId } });
+      const data = await findComments('article', articleId, 1, 100);
+      logger.info(`============用户:${userId}评论文章:${articleId}成功============`);
+      packageResponse('success', { data: { comments: data.comments }, successMessage: type === 1 ? '评论成功' : '回复成功' }, res);
+    } catch (err) {
+      packageResponse('error', { errorCode: 'COMMENT_CREATE_FAILED', errorMessage: '评论失败: ' + err }, res);
     }
   }
 
-  // 新增视频评论/回复
   static async createVideoComment(req, res, next) {
     const { error } = schemaCreateVideoComment.validate(req.body);
-    if (!error) {
-      const { videoId, userId, content, commentId, type, replyTo } = req.body;
+    if (error) {
+      return sendError(res, 'COMMENT_PARAM_INVALID', '评论参数错误');
+    }
+
+    const actor = getActor(req);
+    const { videoId, commentId, type, replyTo } = req.body;
+    const validated = validateCommentContent(req.body.content, type);
+    if (validated.errorCode) {
+      return sendError(res, validated.errorCode, validated.errorMessage);
+    }
+
+    try {
+      const userId = actor.userId || req.body.userId;
+      if (!userId) return sendError(res, 'AUTH_REQUIRED', '请先登录', 401);
+
       if (type === 1) {
-        // 添加评论
-        try {
-          await VideoCommentModel.create({ userId, videoId, content });
-          let commentData = await DiscussController.findVideo({ id: videoId });  // 该评论详情
-          let commentUserData = await UserModel.findOne({ where: { id: userId } }); // 评论人详情
-          let videoData = await VideoModel.findOne({ where: { id: videoId } }); // 评论的视频详情
-          if (videoData.userId != userId) {
-            // 新建提醒
-            await NotificationModel.create({
-              from: userId,
-              fromName: commentUserData.username,
-              toName: videoData.author,
-              content,
-              videoId,
-            });
-          }
-          packageResponse('success', { data: commentData, successMessage: '评论成功' }, res);
-          logger.info(`============用户:${userId}对文章${videoId}评论成功============`);
-        } catch (err) {
-          packageResponse('error', { errorMessage: '评论失败：' + err }, res);
-          logger.info(`============用户:${userId}对文章${videoId}评论失败:${err}============`);
+        await VideoCommentModel.create({ userId, videoId, content: validated.value });
+        const commentUserData = await UserModel.findOne({ where: { id: userId } });
+        const videoData = await VideoModel.findOne({ where: { id: videoId } });
+        if (videoData && commentUserData && videoData.userId != userId) {
+          await NotificationModel.create({
+            from: userId,
+            fromName: commentUserData.username,
+            toName: videoData.author,
+            content: validated.value,
+            videoId,
+          });
         }
       } else {
-        // 添加回复
-        try {
-          let commentUserData = await UserModel.findOne({ where: { id: userId } }); // 评论人详情
-          let replyToUserData = await UserModel.findOne({ where: { id: replyTo } }); // 被回复人详情
-          await VideoReplyModel.create({ userId, videoId, content, videocommentId: commentId, replyTo, replyUser: replyToUserData.username });
-          let videoData = await VideoModel.findOne({ where: { id: videoId } }); // 评论的视频详情
-          let commentData = await DiscussController.findVideo({ id: videoId });
-          if (replyToUserData.id != userId && videoData.userId != userId) {
-            // 新建提醒
-            await NotificationModel.create({
-              from: userId,
-              fromName: commentUserData.username,
-              toName: replyToUserData.username,
-              content,
-              videoId,
-            });
-          }
-          packageResponse('success', { data: commentData, successMessage: '回复成功' }, res);
-          logger.info(`============用户:${commentUserData.username}对用户${replyToUserData.username}回复成功============`);
-        } catch (err) {
-          console.log(err);
-          packageResponse('error', { errorMessage: '回复失败：' + err }, res);
-          logger.info(`============用户:${commentUserData.username}对用户${replyToUserData.username}回复失败:${err}============`);
+        const commentUserData = await UserModel.findOne({ where: { id: userId } });
+        const replyToUserData = await UserModel.findOne({ where: { id: replyTo } });
+        const videoData = await VideoModel.findOne({ where: { id: videoId } });
+        await VideoReplyModel.create({
+          userId,
+          videoId,
+          content: validated.value,
+          videocommentId: commentId,
+          replyTo,
+          replyUser: replyToUserData ? replyToUserData.username : '',
+        });
+        if (replyToUserData && videoData && commentUserData && replyToUserData.id != userId && videoData.userId != userId) {
+          await NotificationModel.create({
+            from: userId,
+            fromName: commentUserData.username,
+            toName: replyToUserData.username,
+            content: validated.value,
+            videoId,
+          });
         }
       }
-      // 评论和回复都会加热度
-      const data = await VideoModel.findOne({ where: { id: videoId } });
-      VideoModel.update({ recommend: ++data.recommend }, { where: { id: videoId } });
 
-    } else {
-      packageResponse('error', { errorMessage: '评论失败:' + error }, res);
+      const video = await VideoModel.findOne({ where: { id: videoId } });
+      if (video) VideoModel.update({ recommend: video.recommend + 1 }, { where: { id: videoId } });
+      const data = await findComments('video', videoId, 1, 100);
+      logger.info(`============用户:${userId}评论视频:${videoId}成功============`);
+      packageResponse('success', { data: { comments: data.comments }, successMessage: type === 1 ? '评论成功' : '回复成功' }, res);
+    } catch (err) {
+      packageResponse('error', { errorCode: 'COMMENT_CREATE_FAILED', errorMessage: '评论失败: ' + err }, res);
     }
   }
 
-  // 删除评论/回复
   static async deleteComment(req, res, next) {
     const { error } = schemaDeleteComment.validate(req.body);
-    if (!error) {
-      const { replyId, commentId, type } = req.body;
-      // 删除评论
+    if (error) {
+      return sendError(res, 'COMMENT_DELETE_PARAM_INVALID', '删除评论参数错误');
+    }
+
+    const actor = getActor(req);
+    const { replyId, commentId, type } = req.body;
+
+    try {
       if (type === 1) {
-        await sequelize.query(
-          `delete comment, reply from comment left join reply on comment.id=reply.commentId where comment.id=${commentId}`
-        );
+        const comment = await CommentModel.findOne({ where: { id: commentId } });
+        if (!comment) return sendError(res, 'COMMENT_NOT_FOUND', '评论不存在', 404);
+        if (!canDelete(actor, comment.userId)) return sendError(res, 'COMMENT_DELETE_FORBIDDEN', '无权删除该评论', 403);
+
+        await ReplyModel.destroy({ where: { commentId } });
+        await CommentModel.destroy({ where: { id: commentId } });
         packageResponse('success', { successMessage: '删除评论成功' }, res);
       } else {
-        // 删除回复
+        const reply = await ReplyModel.findOne({ where: { id: replyId } });
+        if (!reply) return sendError(res, 'COMMENT_NOT_FOUND', '回复不存在', 404);
+        if (!canDelete(actor, reply.userId)) return sendError(res, 'COMMENT_DELETE_FORBIDDEN', '无权删除该回复', 403);
+
         await ReplyModel.destroy({ where: { id: replyId } });
         packageResponse('success', { successMessage: '删除回复成功' }, res);
       }
-    } else {
-      packageResponse('error', { errorMessage: '删除评论失败:' + error }, res);
+    } catch (err) {
+      packageResponse('error', { errorCode: 'COMMENT_DELETE_FAILED', errorMessage: '删除评论失败: ' + err }, res);
     }
   }
 
-  // 删除视频评论/回复
   static async deleteVideoComment(req, res, next) {
     const { error } = schemaDeleteComment.validate(req.body);
-    if (!error) {
-      const { replyId, commentId, type } = req.body;
-      // 删除评论
+    if (error) {
+      return sendError(res, 'COMMENT_DELETE_PARAM_INVALID', '删除评论参数错误');
+    }
+
+    const actor = getActor(req);
+    const { replyId, commentId, type } = req.body;
+
+    try {
       if (type === 1) {
-        await VideoCommentModel.destroy({ where: { id: commentId } });
+        const comment = await VideoCommentModel.findOne({ where: { id: commentId } });
+        if (!comment) return sendError(res, 'COMMENT_NOT_FOUND', '评论不存在', 404);
+        if (!canDelete(actor, comment.userId)) return sendError(res, 'COMMENT_DELETE_FORBIDDEN', '无权删除该评论', 403);
+
         await VideoReplyModel.destroy({ where: { videocommentId: commentId } });
+        await VideoCommentModel.destroy({ where: { id: commentId } });
         packageResponse('success', { successMessage: '删除评论成功' }, res);
       } else {
-        // 删除回复
+        const reply = await VideoReplyModel.findOne({ where: { id: replyId } });
+        if (!reply) return sendError(res, 'COMMENT_NOT_FOUND', '回复不存在', 404);
+        if (!canDelete(actor, reply.userId)) return sendError(res, 'COMMENT_DELETE_FORBIDDEN', '无权删除该回复', 403);
+
         await VideoReplyModel.destroy({ where: { id: replyId } });
         packageResponse('success', { successMessage: '删除回复成功' }, res);
       }
-    } else {
-      packageResponse('error', { errorMessage: '删除评论失败:' + error }, res);
+    } catch (err) {
+      packageResponse('error', { errorCode: 'COMMENT_DELETE_FAILED', errorMessage: '删除评论失败: ' + err }, res);
     }
   }
 
-  // 查询回复信息
   static async getNotice(req, res, next) {
     const { error } = schemaSearchNotice.validate(req.body);
     if (!error) {
       try {
         const { userId } = req.body;
-        let replyToUserData = await UserModel.findOne({ where: { id: userId } }); // 被回复人详情
+        let replyToUserData = await UserModel.findOne({ where: { id: userId } });
         const data = await NotificationModel.findAndCountAll({ where: { toName: replyToUserData.username }, order: [['createdAt', 'DESC']] });
         packageResponse('success', { data }, res);
       } catch (err) {
@@ -299,7 +429,6 @@ class DiscussController {
     }
   }
 
-  // 标记已读
   static async updateNotice(req, res, next) {
     const { error } = schemaUpdateNotice.validate(req.body);
     if (!error) {
@@ -308,10 +437,10 @@ class DiscussController {
         NotificationModel.update({ read: 1 }, { where: { id } });
         packageResponse('success', { successMessage: '更新回复状态成功' }, res);
       } catch (err) {
-        packageResponse('error', { errorMessage: '更新回复状态失败:' + err }, res);
+        packageResponse('error', { errorMessage: '更新回复状态失败' + err }, res);
       }
     } else {
-      packageResponse('error', { errorMessage: '更新回复状态失败:' + error }, res);
+      packageResponse('error', { errorMessage: '更新回复状态失败' + error }, res);
     }
   }
 }

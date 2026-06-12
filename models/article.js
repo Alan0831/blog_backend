@@ -13,6 +13,7 @@ module.exports = (sequelize, dataTypes) => {
       collectionCount: { type: dataTypes.INTEGER(11), defaultValue: 0 }, // 收藏数
       recommend: { type: dataTypes.INTEGER(11), defaultValue: 0 }, // 热度
       tagList: {type: dataTypes.STRING(255), allowNull: false},
+      partition: { type: dataTypes.STRING(20), allowNull: false, defaultValue: 'codeStudy' },
       articleCover: {type: dataTypes.STRING(255), allowNull: true}, // 文章封面
       visibleType: {
         type: dataTypes.TINYINT,

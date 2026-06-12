@@ -10,6 +10,20 @@ const {LoggerMiddleware} = require('./middlewares/logger.js');
 
 var app = express();
 
+function setVideoHeaders(res, filePath) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Range, Content-Type, Origin, Accept');
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges');
+
+  if (filePath.endsWith('.m3u8')) {
+    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+  } else if (filePath.endsWith('.ts')) {
+    res.setHeader('Content-Type', 'video/mp2t');
+  } else if (filePath.endsWith('.mp4')) {
+    res.setHeader('Content-Type', 'video/mp4');
+  }
+}
 
 // moddlewares
 const authHandler = require('./middlewares/authHandler')
@@ -25,6 +39,16 @@ app.use(bodyParser.urlencoded({ extended: false }))
 app.use(bodyParser.json())
 app.use(cookieParser());
 app.use(express.static(path.join(__dirname, 'public')));
+app.options('/videoPath/*', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Range, Content-Type, Origin, Accept');
+  res.sendStatus(204);
+});
+app.use('/videoPath', express.static(path.join(__dirname, 'static/video'), {
+  index: false,
+  setHeaders: setVideoHeaders,
+}));
 app.use(authHandler);
 app.use(LoggerMiddleware);
 

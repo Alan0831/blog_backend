@@ -14,6 +14,7 @@ module.exports = (sequelize, dataTypes) => {
       collectionCount: { type: dataTypes.INTEGER(11), defaultValue: 0 }, // 收藏数
       recommend: { type: dataTypes.INTEGER(11), defaultValue: 0 }, // 热度
       tagList: {type: dataTypes.STRING(255), allowNull: true},
+      partition: { type: dataTypes.STRING(20), allowNull: false, defaultValue: 'codeStudy' },
       poster: {type: dataTypes.STRING(255), allowNull: true}, // 视频封面
       visibleType: {
         type: dataTypes.TINYINT,

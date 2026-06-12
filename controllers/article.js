@@ -5,6 +5,26 @@ const { v4: uuidv4 } = require('uuid');
 const { find } = require('../controllers/user');
 const { findIsCollection } = require('../controllers/collection');
 const { logger } = require('../middlewares/logger');
+const { normalizePartition, getPartitionWhere } = require('../utils/partition');
+
+function parseTagList(tagList) {
+    if (Array.isArray(tagList)) return tagList;
+    if (!tagList) return [];
+    try {
+        return JSON.parse(tagList);
+    } catch (err) {
+        return [];
+    }
+}
+
+function pickDefined(data) {
+    return Object.keys(data).reduce((result, key) => {
+        if (data[key] !== undefined) {
+            result[key] = data[key];
+        }
+        return result;
+    }, {});
+}
 
 const schemaSearchArticle = joi.object({
     id: joi.number().required(),
@@ -23,12 +43,13 @@ const schemaCreateArticle = joi.object({
     visibleType: joi.number(),
     password: joi.string().allow(null, ''),
     articleCover: joi.string().allow(null, ''),
+    partition: joi.string().allow(null, ''),
 });
 const schemaEditArticle = joi.object({
     articleId: joi.number().required(),
     authorId: joi.number().required(),
-    title: joi.string().required(),
-    content: joi.string().required(),
+    title: joi.string(),
+    content: joi.string(),
     categoryList: joi.string(),
     tagList: joi.array(),
     type: joi.boolean(),
@@ -38,6 +59,7 @@ const schemaEditArticle = joi.object({
     visibleType: joi.number().allow(null, ''),
     password: joi.string().allow(null, ''),
     articleCover: joi.string().allow(null, ''),
+    partition: joi.string().allow(null, ''),
 });
 const schemaDeleteArticle = joi.object({
     articleId: joi.number().required(),
@@ -66,7 +88,8 @@ const schemaSearchLikeArticle = joi.object({
 class ArticleControllers {
     //  获取文章列表
     static async getArticleList(req, res, next) {
-        const { pageNum = 1, pageSize = 10, preview = 1, keyword = '', userId = '' } = req.body;
+        const { pageNum = 1, pageSize = 10, preview = 1, keyword = '', userId = '', partition } = req.body;
+        const partitionWhere = getPartitionWhere(partition);
         let localIP = req?.socket?.remoteAddress || '';
         let articleOrder = [['createdAt', 'DESC']];
         let author = '';
@@ -79,7 +102,8 @@ class ArticleControllers {
             author = authorData.username;
             findParam = {
                 where: {
-                    author
+                    author,
+                    ...partitionWhere,
                 },
                 include: [
                     // { model: TagModel, attributes: ['name'], where: tagFilter },
@@ -101,6 +125,7 @@ class ArticleControllers {
                 where: {
                     id: { $not: -1 },   // 过滤关于页面的副本
                     visibleType: { $not: 3 },
+                    ...partitionWhere,
                     $or: {
                         title: {
                             $like: `%${keyword}%`
@@ -179,9 +204,10 @@ class ArticleControllers {
 
     //   获取推荐文章列表
     static async getRecommendArticleList(req, res, next) {
+        const { partition } = req.body;
         let articleOrder = [['recommend', 'DESC']];
         let findParam = {
-            where: { visibleType: { $not: 3 } },
+            where: { visibleType: { $not: 3 }, ...getPartitionWhere(partition) },
             attributes: { exclude: ['content'] },
             limit: 6,
             order: articleOrder,
@@ -219,7 +245,7 @@ class ArticleControllers {
                         include: [
                             {
                                 model: ReplyModel,
-                                attributes: ['id', 'content', 'createdAt', 'replyUser'],
+                                attributes: ['id', 'content', 'createdAt', 'replyTo', 'replyUser'],
                                 include: [{ model: UserModel, as: 'user', attributes: { exclude: ['updatedAt', 'password'] } }],
                             },
                             { model: UserModel, as: 'user', attributes: { exclude: ['updatedAt', 'password'] } },
@@ -235,7 +261,18 @@ class ArticleControllers {
             if (data) {
                 // 更新点击数和热度
                 ArticleModel.update({ viewCount: ++data.viewCount, recommend: ++data.recommend }, { where: { id }, silent: true });
-                let _data = { ...data.dataValues, isCollected };
+                let _data = {
+                    ...data.dataValues,
+                    isCollected,
+                    id: data.id,
+                    title: data.title || '',
+                    content: data.content || '',
+                    tagList: parseTagList(data.tagList),
+                    visibleType: data.visibleType,
+                    partition: normalizePartition(data.partition),
+                    articleCover: data.articleCover || '',
+                    articleclassId: data.articleclassId || null,
+                };
                 packageResponse('success', { data: _data }, res);
             } else {
                 packageResponse('error', { errorMessage: '该文章已不存在！' }, res);
@@ -248,7 +285,8 @@ class ArticleControllers {
         const { error } = schemaCreateArticle.validate(req.body);
 
         if (!error) {
-            const { title, content, classId = null, tagList = [], authorId, visibleType, password, articleCover, type, top } = req.body;
+            const { title, content, classId = null, tagList = [], authorId, visibleType, password, articleCover, type, top, partition } = req.body;
+            const normalizedPartition = normalizePartition(partition);
             const result = await ArticleModel.findOne({ where: { title } });
             console.log(result);
             logger.info(`============用户ID:${authorId}创建文章============`);
@@ -270,7 +308,7 @@ class ArticleControllers {
                     const authorData = await find({ id: authorId });
                     if (authorData) {
                         const data = await ArticleModel.create(
-                            { title, content, articleCover, visibleType, articleclassId: classId, tagList: JSON.stringify(tags), author: authorData.username, userId: authorId },
+                            { title, content, articleCover, visibleType, articleclassId: classId, tagList: JSON.stringify(tags), partition: normalizedPartition, author: authorData.username, userId: authorId },
                         )
                         //  如果传了classId，则更新文章归属大类
                         if (classId) {
@@ -302,16 +340,31 @@ class ArticleControllers {
     static async editArticle(req, res, next) {
         const { error } = schemaEditArticle.validate(req.body);
         if (!error) {
-            const { articleId, title, content, oldClassId = null, articleCover, visibleType, password, classId = null, tagList = [], authorId, type, top } = req.body;
+            const { articleId, title, content, oldClassId = null, articleCover, visibleType, password, classId = null, tagList, authorId, type, top, partition } = req.body;
             try {
-                const tags = tagList || [];
-                const data = await ArticleModel.update({ title, content, articleCover, visibleType, articleclassId: classId, tagList: JSON.stringify(tags), }, { where: { id: articleId }, silent: true });
+                const updateData = pickDefined({
+                    title,
+                    content,
+                    articleCover,
+                    visibleType,
+                    partition: Object.prototype.hasOwnProperty.call(req.body, 'partition') ? normalizePartition(partition) : undefined,
+                });
+
+                if (Object.prototype.hasOwnProperty.call(req.body, 'classId')) {
+                    updateData.articleclassId = classId;
+                }
+
+                if (Object.prototype.hasOwnProperty.call(req.body, 'tagList')) {
+                    updateData.tagList = JSON.stringify(tagList || []);
+                }
+
+                await ArticleModel.update(updateData, { where: { id: articleId }, silent: true });
                 //  如果传了classId，则更新文章归属大类
-                if (classId) {
+                if (Object.prototype.hasOwnProperty.call(req.body, 'classId') && classId) {
                     await ArticleControllers._updateArticleClass(articleId, oldClassId, classId, authorId);
                 }
                 //  如果设置了加锁，则更新密码
-                if (visibleType === 2) {
+                if (visibleType === 2 && Object.prototype.hasOwnProperty.call(req.body, 'password') && password !== '') {
                     await ArticleControllers.updateArticleLock(articleId, authorId, password);
                 }
                 logger.info(`============用户ID:${authorId}修改文章:${articleId}============`);
@@ -485,12 +538,13 @@ class ArticleControllers {
 
     //  更新文章锁
     static async updateArticleLock(articleId, userId, password) {
-        console.log(articleId)
         let lockData = await PrivacyArticleModel.findOne({ where: { articleId } });
         if (lockData) {
-            PrivacyArticleModel.update({ password }, { where: { articleId } });
+            if (password !== undefined && password !== '') {
+                PrivacyArticleModel.update({ password }, { where: { articleId } });
+            }
         } else {
-            PrivacyArticleModel.create({ articleId, userId, password });
+            PrivacyArticleModel.create({ articleId, userId, password: password || '' });
         }
     }
 

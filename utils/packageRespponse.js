@@ -14,6 +14,9 @@ function packageResponse(status, option, res) {
                 data: option.data || {},
                 errorMessage: option.errorMessage,
             };
+            if (option.errorCode) {
+                json.errorCode = option.errorCode;
+            }
             break;
         default:
             json = {};
