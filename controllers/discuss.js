@@ -1,6 +1,7 @@
 const joi = require('joi');
 const { packageResponse } = require('../utils/packageRespponse');
 const { logger } = require('../middlewares/logger');
+const noticeSocket = require('../websocket');
 
 const {
   article: ArticleModel,
@@ -40,7 +41,7 @@ const schemaDeleteComment = joi.object({
 });
 
 const schemaSearchNotice = joi.object({
-  userId: joi.number().required(),
+  userId: joi.number(),
 });
 
 const schemaUpdateNotice = joi.object({
@@ -126,6 +127,32 @@ function validateCommentContent(content, type) {
 function sendError(res, errorCode, errorMessage, status = 400) {
   res.status(status);
   packageResponse('error', { errorCode, errorMessage }, res);
+}
+
+async function getCurrentUsername(req) {
+  const actor = getActor(req);
+  if (actor.username) return actor.username;
+
+  // 兼容历史 token：如果 token 中只有 userId，则再查一次用户表补齐 username。
+  if (actor.userId) {
+    const user = await UserModel.findOne({ where: { id: actor.userId } });
+    return user ? user.username : '';
+  }
+
+  return '';
+}
+
+async function createNotificationAndPush(data) {
+  const notice = await NotificationModel.create(data);
+
+  // 新增通知后立即向接收人推送未读数，避免 websocket 继续依赖定时轮询。
+  try {
+    await noticeSocket.pushNoticeUnread(data.toName);
+  } catch (err) {
+    logger.error(`通知 websocket 推送失败: ${err}`);
+  }
+
+  return notice;
 }
 
 async function findComments(targetType, targetId, pageNum = 1, pageSize = 20) {
@@ -247,7 +274,7 @@ class DiscussController {
         const commentUserData = await UserModel.findOne({ where: { id: userId } });
         const articleData = await ArticleModel.findOne({ where: { id: articleId } });
         if (articleData && commentUserData && articleData.userId != userId) {
-          await NotificationModel.create({
+          await createNotificationAndPush({
             from: userId,
             fromName: commentUserData.username,
             toName: articleData.author,
@@ -268,7 +295,7 @@ class DiscussController {
           replyUser: replyToUserData ? replyToUserData.username : '',
         });
         if (replyToUserData && articleData && commentUserData && replyToUserData.id != userId && articleData.userId != userId) {
-          await NotificationModel.create({
+          await createNotificationAndPush({
             from: userId,
             fromName: commentUserData.username,
             toName: replyToUserData.username,
@@ -310,7 +337,7 @@ class DiscussController {
         const commentUserData = await UserModel.findOne({ where: { id: userId } });
         const videoData = await VideoModel.findOne({ where: { id: videoId } });
         if (videoData && commentUserData && videoData.userId != userId) {
-          await NotificationModel.create({
+          await createNotificationAndPush({
             from: userId,
             fromName: commentUserData.username,
             toName: videoData.author,
@@ -331,7 +358,7 @@ class DiscussController {
           replyUser: replyToUserData ? replyToUserData.username : '',
         });
         if (replyToUserData && videoData && commentUserData && replyToUserData.id != userId && videoData.userId != userId) {
-          await NotificationModel.create({
+          await createNotificationAndPush({
             from: userId,
             fromName: commentUserData.username,
             toName: replyToUserData.username,
@@ -415,32 +442,56 @@ class DiscussController {
 
   static async getNotice(req, res, next) {
     const { error } = schemaSearchNotice.validate(req.body);
-    if (!error) {
-      try {
-        const { userId } = req.body;
-        let replyToUserData = await UserModel.findOne({ where: { id: userId } });
-        const data = await NotificationModel.findAndCountAll({ where: { toName: replyToUserData.username }, order: [['createdAt', 'DESC']] });
-        packageResponse('success', { data }, res);
-      } catch (err) {
-        packageResponse('error', { errorMessage: '查询回复失败:' + err }, res);
-      }
-    } else {
-      packageResponse('error', { errorMessage: '查询回复失败:' + error }, res);
+    if (error) {
+      return packageResponse('error', { errorMessage: '查询回复失败:' + error }, res);
+    }
+
+    try {
+      const username = await getCurrentUsername(req);
+      if (!username) return sendError(res, 'AUTH_USER_INVALID', '登录信息无效，请重新登录', 401);
+
+      /* 通知归属以后端 token 解析出的用户名为准，忽略前端传入的 userId，防止越权查询。 */
+      const data = await NotificationModel.findAndCountAll({ where: { toName: username }, order: [['createdAt', 'DESC']] });
+      packageResponse('success', { data }, res);
+    } catch (err) {
+      packageResponse('error', { errorMessage: '查询回复失败:' + err }, res);
+    }
+  }
+
+  static async getNoticeUnreadCount(req, res, next) {
+    try {
+      const username = await getCurrentUsername(req);
+      if (!username) return sendError(res, 'AUTH_USER_INVALID', '登录信息无效，请重新登录', 401);
+
+      /* 轻量未读数接口，只返回 Header 角标需要的 unreadCount。 */
+      const unreadCount = await noticeSocket.countUnreadByUsername(username);
+      packageResponse('success', { data: { unreadCount } }, res);
+    } catch (err) {
+      packageResponse('error', { errorCode: 'NOTICE_UNREAD_QUERY_FAILED', errorMessage: '查询未读通知数量失败: ' + err }, res);
     }
   }
 
   static async updateNotice(req, res, next) {
     const { error } = schemaUpdateNotice.validate(req.body);
-    if (!error) {
-      try {
-        const { id } = req.body;
-        NotificationModel.update({ read: 1 }, { where: { id } });
-        packageResponse('success', { successMessage: '更新回复状态成功' }, res);
-      } catch (err) {
-        packageResponse('error', { errorMessage: '更新回复状态失败' + err }, res);
-      }
-    } else {
-      packageResponse('error', { errorMessage: '更新回复状态失败' + error }, res);
+    if (error) {
+      return packageResponse('error', { errorMessage: '更新回复状态失败' + error }, res);
+    }
+
+    try {
+      const { id } = req.body;
+      const username = await getCurrentUsername(req);
+      if (!username) return sendError(res, 'AUTH_USER_INVALID', '登录信息无效，请重新登录', 401);
+
+      const notice = await NotificationModel.findOne({ where: { id } });
+      if (!notice) return sendError(res, 'NOTICE_NOT_FOUND', '通知不存在', 404);
+      if (notice.toName !== username) return sendError(res, 'NOTICE_FORBIDDEN', '无权操作该通知', 403);
+
+      /* 只允许当前登录用户标记自己的通知，避免伪造通知 id 标记他人通知。 */
+      await NotificationModel.update({ read: 1 }, { where: { id, toName: username } });
+      await noticeSocket.pushNoticeUnread(username);
+      packageResponse('success', { successMessage: '更新回复状态成功' }, res);
+    } catch (err) {
+      packageResponse('error', { errorMessage: '更新回复状态失败' + err }, res);
     }
   }
 }

@@ -6,6 +6,7 @@ const { find } = require('../controllers/user');
 const { findIsCollection } = require('../controllers/collection');
 const { logger } = require('../middlewares/logger');
 const { normalizePartition, getPartitionWhere } = require('../utils/partition');
+const { appendArticleClassFilter, appendContentListFilter, appendKeywordFilter } = require('../utils/contentListFilter');
 
 function parseTagList(tagList) {
     if (Array.isArray(tagList)) return tagList;
@@ -83,28 +84,48 @@ const schemaValidateArticleLock = joi.object({
 });
 const schemaSearchLikeArticle = joi.object({
     articleId: joi.number().required(),
+    pageNum: joi.number(),
+    pageSize: joi.number(),
+    keyword: joi.string().allow(null, ''),
+    partition: joi.string().allow(null, ''),
 });
 
 class ArticleControllers {
     //  获取文章列表
     static async getArticleList(req, res, next) {
-        const { pageNum = 1, pageSize = 10, preview = 1, keyword = '', userId = '', partition } = req.body;
-        const partitionWhere = getPartitionWhere(partition);
+        const {
+            pageNum = 1,
+            pageSize = 10,
+            preview = 1,
+            keyword = '',
+            userId = '',
+            partition,
+            articleclassId,
+            author: filterAuthor,
+            title,
+            visibleType,
+            createdAtStart,
+            createdAtEnd,
+        } = req.body;
+        // partition 是可选筛选项；只有前端明确传入时才按分区过滤。
+        const partitionWhere = String(partition || '').trim() ? getPartitionWhere(partition) : {};
         let localIP = req?.socket?.remoteAddress || '';
         let articleOrder = [['createdAt', 'DESC']];
         let author = '';
         let findParam = {};
+        const commonFilter = { author: filterAuthor, title, visibleType, createdAtStart, createdAtEnd };
         // 如果传值有userId，则查询对应的author
         if (userId) {
             logger.info(`============userId为:${userId},IP为${localIP}的用户开始请求文章列表============`);
             const authorData = await find({ id: userId });
             if (!authorData) return;
             author = authorData.username;
+            const where = appendArticleClassFilter(
+                appendContentListFilter({ ...partitionWhere }, commonFilter, { fixedAuthor: author, allowPrivate: true }),
+                articleclassId
+            );
             findParam = {
-                where: {
-                    author,
-                    ...partitionWhere,
-                },
+                where,
                 include: [
                     // { model: TagModel, attributes: ['name'], where: tagFilter },
                     {
@@ -121,20 +142,15 @@ class ArticleControllers {
             };
         } else {
             logger.info(`============IP为${localIP}的用户开始请求文章列表============`);
+            const where = appendArticleClassFilter(
+                appendKeywordFilter(
+                    appendContentListFilter({ id: { $not: -1 }, ...partitionWhere }, commonFilter, { allowPrivate: false }),
+                    keyword
+                ),
+                articleclassId
+            );
             findParam = {
-                where: {
-                    id: { $not: -1 },   // 过滤关于页面的副本
-                    visibleType: { $not: 3 },
-                    ...partitionWhere,
-                    $or: {
-                        title: {
-                            $like: `%${keyword}%`
-                        },
-                        content: {
-                            $like: `%${keyword}%`
-                        },
-                    },
-                },
+                where,
                 include: [
                     // { model: TagModel, attributes: ['name'], where: tagFilter },
                     {
@@ -159,6 +175,10 @@ class ArticleControllers {
             packageResponse('success', { data: {} }, res);
         } else {
             const data = await ArticleModel.findAndCountAll(findParam);
+            data.rows.forEach(d => {
+                // 旧数据可能没有分区，列表返回时统一按默认分区回填，方便前端筛选回显。
+                d.setDataValue('partition', normalizePartition(d.partition));
+            });
             if (preview === 1 && !author) {
                 data.rows.forEach(d => {
                     d.content = d.content.slice(0, 500); // 预览模式减少传输数据
@@ -207,6 +227,7 @@ class ArticleControllers {
         const { partition } = req.body;
         let articleOrder = [['recommend', 'DESC']];
         let findParam = {
+            // 详情页侧边栏推荐需要和当前文章保持同一分区；缺省时按默认分区兜底。
             where: { visibleType: { $not: 3 }, ...getPartitionWhere(partition) },
             attributes: { exclude: ['content'] },
             limit: 6,
@@ -216,6 +237,10 @@ class ArticleControllers {
         };
         try {
             const data = await ArticleModel.findAndCountAll(findParam);
+            data.rows.forEach(d => {
+                // 旧数据没有分区时，返回默认分区，避免前端侧边栏拿到空值。
+                d.setDataValue('partition', normalizePartition(d.partition));
+            });
             packageResponse('success', { data }, res);
         } catch (err) {
             packageResponse('error', { errorMessage: err }, res);
@@ -569,28 +594,39 @@ class ArticleControllers {
     }
 
     //  按照文章大类搜索文章
-    static async searchArticleByClass(classId) {
+    static async searchArticleByClass(classId, partition) {
         let data = await ArticleclassModel.findOne({ where: { id: classId } });
         if (data) {
             let articleList = JSON.parse(data.articleList);
-            let result = await ArticleModel.findAll({ where: { id: articleList, visibleType: { $not: 3 } }, attributes: { exclude: ['content'] } });
+            let result = await ArticleModel.findAll({
+                // 猜你喜欢的大类推荐也按当前详情分区过滤，避免两个分区内容混排。
+                where: { id: articleList, visibleType: { $not: 3 }, ...getPartitionWhere(partition) },
+                attributes: { exclude: ['content'] }
+            });
             return result;
         }
+        return [];
     }
 
     //  查询猜你喜欢列表
     static async searchLikeArticle(req, res, next) {
         const { error } = schemaSearchLikeArticle.validate(req.body);
         if (!error) {
-            const { articleId } = req.body;
+            const { articleId, partition } = req.body;
             try {
                 let articleData = await ArticleModel.findOne({ where: { id: articleId } });
+                if (!articleData) {
+                    return packageResponse('error', { errorMessage: '该文章已不存在！' }, res);
+                }
                 let { articleclassId, tagList } = articleData;
+                // 优先使用前端传入的详情分区；未传时用当前文章分区兜底，旧数据默认 codeStudy。
+                const currentPartition = normalizePartition(partition || articleData.partition);
+                const partitionWhere = getPartitionWhere(currentPartition);
                 let classArticleList = [];
                 let tagArticleList = [];
                 //  取文章大类中的前3项
                 if (articleclassId) {
-                    classArticleList = await ArticleControllers.searchArticleByClass(articleclassId);
+                    classArticleList = await ArticleControllers.searchArticleByClass(articleclassId, currentPartition);
                     classArticleList = classArticleList.slice(0, 3);
                 }
 
@@ -599,7 +635,11 @@ class ArticleControllers {
                     let _tagListList = JSON.parse(tagList);
                     let random = Math.floor(Math.random() * _tagListList.length);
                     let randomTag = _tagListList[random];
-                    tagArticleList = await ArticleModel.findAll({ where: { $or: { tagList: { $like: `%${randomTag}%` } }, visibleType: { $not: 3 } }, attributes: { exclude: ['content'] } });
+                    tagArticleList = await ArticleModel.findAll({
+                        // tag 相似推荐同样限制在当前分区内。
+                        where: { $or: { tagList: { $like: `%${randomTag}%` } }, visibleType: { $not: 3 }, ...partitionWhere },
+                        attributes: { exclude: ['content'] }
+                    });
                     if (classArticleList.length < 3) {
                         tagArticleList = tagArticleList.slice(0, 6 - classArticleList.length);
                     } else {
@@ -618,6 +658,10 @@ class ArticleControllers {
                     });
                 }
                 resultTotalList = uniqueObjects(resultTotalList, 'id').filter((item) => item.id != articleId);
+                resultTotalList.forEach(item => {
+                    // 旧数据没有分区时，返回默认分区，方便侧边栏继续向后传递分区参数。
+                    item.setDataValue('partition', normalizePartition(item.partition));
+                });
                 packageResponse('success', { data: resultTotalList }, res);
             } catch (err) {
                 packageResponse('error', { errorMessage: err }, res);

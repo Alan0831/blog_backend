@@ -1,27 +1,72 @@
 const jwt = require('jsonwebtoken')
 const { TOKEN } = require('../config')
 
+function normalizeToken(token) {
+  if (Array.isArray(token)) token = token[0];
+  if (!token || typeof token !== 'string') return '';
+  return token.replace(/^Bearer\s+/i, '').trim();
+}
+
+function getTokenFromRequest(req) {
+  return normalizeToken(
+    req.headers['authorization'] ||
+    req.headers['token'] ||
+    req.headers['x-token'] ||
+    req.headers['x-access-token'] ||
+    (req.cookies && req.cookies.token) ||
+    (req.body && req.body.token) ||
+    (req.query && req.query.token)
+  );
+}
+
 exports.createToken = info => {
   const token = jwt.sign(info, TOKEN.secret, { expiresIn: TOKEN.expiresIn })
   return token;
 }
 
-exports.checkToken = (req, res) => {
-  let token = req.headers['authorization'];
-  if (!token) return false;
+exports.getTokenMeta = token => {
+  const decoded = jwt.decode(normalizeToken(token)) || {};
+  return {
+    expiresIn: TOKEN.expiresIn,
+    expiresAt: decoded.exp ? decoded.exp * 1000 : null,
+  };
+}
 
-  token = token.replace(/^Bearer\s+/i, '');
+exports.verifyToken = req => {
+  const token = getTokenFromRequest(req);
+  if (!token) {
+    return {
+      valid: false,
+      errorType: 'tokenMissing',
+      errorCode: 'TOKEN_MISSING',
+      errorMessage: '请先登录',
+    };
+  }
 
   try {
     const decoded = jwt.verify(token, TOKEN.secret);
-    const currentTime = new Date().getTime();
-    if (decoded.exp > parseInt(currentTime / 1000)) {
-      req.user = decoded;
-      return true;
-    }
+    req.user = decoded;
+    return { valid: true, decoded };
   } catch (err) {
-    return false;
-  }
+    if (err && err.name === 'TokenExpiredError') {
+      return {
+        valid: false,
+        errorType: 'tokenExpired',
+        errorCode: 'TOKEN_EXPIRED',
+        errorMessage: '登录已过期，请重新登录',
+        expiredAt: err.expiredAt ? err.expiredAt.getTime() : null,
+      };
+    }
 
-  return false;
+    return {
+      valid: false,
+      errorType: 'tokenInvalid',
+      errorCode: 'TOKEN_INVALID',
+      errorMessage: '登录状态无效，请重新登录',
+    };
+  }
+}
+
+exports.checkToken = req => {
+  return exports.verifyToken(req).valid;
 }

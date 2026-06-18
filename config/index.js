@@ -33,7 +33,7 @@ const config = {
   },
   TOKEN: {
     secret: 'guo-test', // secret is very important!
-    expiresIn: '12h' // token 有效期
+    expiresIn: '24h' // token 有效期
   },
   DATABASE: {
     database: 'commit',

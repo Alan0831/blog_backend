@@ -1,4 +1,4 @@
-const { checkToken } = require('../utils/token')
+const { verifyToken } = require('../utils/token')
 const { packageResponse } = require('../utils/packageRespponse');
 
 const METHOD = {
@@ -23,6 +23,7 @@ const verifyList1 = [
   { regexp: /\/updateUser$/, required: METHOD.POST },
   { regexp: /\/updateNotice$/, required: METHOD.POST },
   { regexp: /\/getNotice$/, required: METHOD.POST },
+  { regexp: /\/getNoticeUnreadCount$/, required: METHOD.POST },
 ]
 
 const verifyList2 = [
@@ -59,9 +60,19 @@ module.exports = async (req, res, next) => {
         return;
     }
 
-    if (checkToken(req, res)) {
+    const tokenResult = verifyToken(req);
+
+    if (tokenResult.valid) {
         await next();
     } else {
-        packageResponse('error', { data: {errorType: 'tokenInvalid'}, errorMessage: 'token失效' }, res);
+        res.status(401);
+        packageResponse('error', {
+            data: {
+                errorType: tokenResult.errorType,
+                expiredAt: tokenResult.expiredAt || null,
+            },
+            errorCode: tokenResult.errorCode,
+            errorMessage: tokenResult.errorMessage,
+        }, res);
     }
 }

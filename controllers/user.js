@@ -1,6 +1,6 @@
 const { user: UserModel, sequelize } = require('../models');
 const { packageResponse } = require('../utils/packageRespponse');
-const { createToken } = require('../utils/token');
+const { createToken, getTokenMeta } = require('../utils/token');
 const { comparePassword, encrypt } = require('../utils/bcrypt');
 const PSW = require('../utils/password');
 const joi = require('joi');
@@ -43,6 +43,7 @@ class UserControllers {
                 console.log('isMatch? ====' + isMatch);
                 if (isMatch) {
                     const token = createToken({ username: data.username, userId: data.id, role: data.role }) // 生成 token
+                    const tokenMeta = getTokenMeta(token);
                     let loginObj = {
                         username: data.username, 
                         userId: data.id, 
@@ -50,7 +51,9 @@ class UserControllers {
                         email: data.email,
                         disabledDiscuss: data.disabledDiscuss,
                         gender: data.gender,
-                        token
+                        token,
+                        tokenExpiresIn: tokenMeta.expiresIn,
+                        tokenExpiresAt: tokenMeta.expiresAt
                     };
                     logger.info(`============用户:${req.body.username}登录成功============`);
                     packageResponse('success', { data: loginObj }, res);

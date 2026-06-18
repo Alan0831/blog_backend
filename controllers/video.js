@@ -5,6 +5,7 @@ const { find } = require('../controllers/user');
 const { logger } = require('../middlewares/logger');
 const { findIsCollection } = require('../controllers/collection');
 const { normalizePartition, getPartitionWhere } = require('../utils/partition');
+const { appendContentListFilter, appendKeywordFilter } = require('../utils/contentListFilter');
 const OSS = require('ali-oss');
 const { ALIOSS } = require('../config');
 const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
@@ -278,22 +279,33 @@ class VideoControllers {
 
     // 获取视频列表
     static async getVideoList(req, res, next) {
-        const { pageNum = 1, pageSize = 10, keyword = '', userId = '', partition } = req.body;
-        const partitionWhere = getPartitionWhere(partition);
+        const {
+            pageNum = 1,
+            pageSize = 10,
+            keyword = '',
+            userId = '',
+            partition,
+            author: filterAuthor,
+            title,
+            visibleType,
+            createdAtStart,
+            createdAtEnd,
+        } = req.body;
+        // partition 是可选筛选项；只有前端明确传入时才按分区过滤。
+        const partitionWhere = String(partition || '').trim() ? getPartitionWhere(partition) : {};
         let localIP = req?.socket?.remoteAddress || '';
         let videoOrder = [['createdAt', 'DESC']];
         let findParam = {};
+        const commonFilter = { author: filterAuthor, title, visibleType, createdAtStart, createdAtEnd };
         logger.info(`============userId为:${userId},IP为${localIP}的用户开始请求视频列表============`);
         // 如果传值有userId，则查询对应的author
         if (userId) {
             const authorData = await find({ id: userId });
             if (!authorData) return;
             let author = authorData.username;
+            const where = appendContentListFilter({ ...partitionWhere }, commonFilter, { fixedAuthor: author, allowPrivate: true });
             findParam = {
-                where: {
-                    author,
-                    ...partitionWhere,
-                },
+                where,
                 include: [
                     {
                         model: VideoCommentModel,
@@ -308,20 +320,12 @@ class VideoControllers {
                 distinct: true // count 计算
             };
         } else {
+            const where = appendKeywordFilter(
+                appendContentListFilter({ id: { $not: -1 }, ...partitionWhere }, commonFilter, { allowPrivate: false }),
+                keyword
+            );
             findParam = {
-                where: {
-                    id: { $not: -1 },   // 过滤关于页面的副本
-                    visibleType: { $not: 3 },
-                    ...partitionWhere,
-                    $or: {
-                        title: {
-                            $like: `%${keyword}%`
-                        },
-                        content: {
-                            $like: `%${keyword}%`
-                        },
-                    },
-                },
+                where,
                 include: [
                     {
                         model: VideoCommentModel,
@@ -339,6 +343,10 @@ class VideoControllers {
 
         try {
             const data = await VideoModel.findAndCountAll(findParam);
+            data.rows.forEach(d => {
+                // 旧视频没有分区时按默认分区返回，避免前端编辑和列表筛选拿到空值。
+                d.setDataValue('partition', normalizePartition(d.partition));
+            });
             data.pageSize = pageSize;
             data.pageNum = pageNum;
             packageResponse('success', { data }, res);
@@ -353,6 +361,7 @@ class VideoControllers {
         const { partition } = req.body;
         let videoOrder = [['recommend', 'DESC']];
         let findParam = {
+            // 详情页热门视频按当前视频分区过滤；未传时按默认分区兜底。
             where: { visibleType: { $not: 3 }, ...getPartitionWhere(partition) },
             attributes: { exclude: ['content'] },
             limit: 6,
@@ -362,6 +371,10 @@ class VideoControllers {
         };
         try {
             const data = await VideoModel.findAndCountAll(findParam);
+            data.rows.forEach(d => {
+                // 旧视频没有分区时，返回默认分区，避免侧边栏卡片混用空分区。
+                d.setDataValue('partition', normalizePartition(d.partition));
+            });
             packageResponse('success', { data }, res);
         } catch (err) {
             packageResponse('error', { errorMessage: err }, res);
