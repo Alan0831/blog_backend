@@ -19,6 +19,9 @@ function getTokenFromRequest(req) {
   );
 }
 
+exports.normalizeToken = normalizeToken;
+exports.getTokenFromRequest = getTokenFromRequest;
+
 exports.createToken = info => {
   const token = jwt.sign(info, TOKEN.secret, { expiresIn: TOKEN.expiresIn })
   return token;

@@ -20,13 +20,34 @@ const outputDir = path.join(__dirname, `../static/video`); // 切片输出地址
 let scheduleTask = {};
 const SCHEDULE_TIME = '30 1 1 * * *'; // 每天的1点1分30秒
 
+function readPositiveInt(value, fallback) {
+    const parsed = parseInt(value, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function readBooleanEnv(name, fallback) {
+    const value = process.env[name];
+    if (value === undefined) return fallback;
+    return ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
+}
+
 // ffmpeg 是最吃 CPU/内存的步骤，这里把默认并发限制为 1，避免多个大视频同时切片把服务器内存打满。
-const FFMPEG_MAX_CONCURRENT = Math.max(parseInt(process.env.FFMPEG_MAX_CONCURRENT || '1', 10), 1);
+const FFMPEG_MAX_CONCURRENT = readPositiveInt(process.env.FFMPEG_MAX_CONCURRENT, 1);
 // 每个 ffmpeg 进程内部也限制线程数，默认单线程；如果服务器配置更高，可以通过环境变量 FFMPEG_THREADS 调大。
-const FFMPEG_THREADS = Math.max(parseInt(process.env.FFMPEG_THREADS || '1', 10), 1);
-// HLS 每个 ts 分片的目标时长，默认 3 秒；分片越短首屏和拖动越灵敏，但请求数量也会更多。
-const HLS_SEGMENT_DURATION = Math.max(parseInt(process.env.HLS_SEGMENT_DURATION || '3', 10), 1);
-// 播放端使用的多清晰度配置：低清晰度保证弱网能快速起播，高清晰度保留观感。
+const FFMPEG_THREADS = readPositiveInt(process.env.FFMPEG_THREADS, 1);
+// 小机器默认不生成多清晰度，避免一个视频被重复重编码 2-3 次；需要多档播放时再通过环境变量打开。
+const FFMPEG_ENABLE_MULTI_RENDITION = readBooleanEnv('FFMPEG_ENABLE_MULTI_RENDITION', false);
+// 用户上传的 H.264/AAC 视频通常已经适合网页播放，直接封装成 HLS 可以大幅降低 CPU 消耗。
+const FFMPEG_COPY_WHEN_COMPATIBLE = readBooleanEnv('FFMPEG_COPY_WHEN_COMPATIBLE', true);
+// 兼容编码的视频在不超过该高度时直接切片；超大源视频仍会转成较小尺寸，避免播放流量过高。
+const FFMPEG_COPY_MAX_HEIGHT = readPositiveInt(process.env.FFMPEG_COPY_MAX_HEIGHT, 1080);
+// 非兼容编码需要转码时，默认最高只产出 720p；2 核 2G 服务器不适合默认转 1080p。
+const FFMPEG_MAX_OUTPUT_HEIGHT = readPositiveInt(process.env.FFMPEG_MAX_OUTPUT_HEIGHT, 720);
+const FFMPEG_PRESET = process.env.FFMPEG_PRESET || 'superfast';
+const FFMPEG_CRF = process.env.FFMPEG_CRF || '26';
+// HLS 每个 ts 分片的目标时长，默认 6 秒；比 3 秒更省文件数量和 IO，对小服务器更稳。
+const HLS_SEGMENT_DURATION = readPositiveInt(process.env.HLS_SEGMENT_DURATION, 6);
+// 播放端使用的清晰度配置；默认只选其中一档，需要多清晰度时由 FFMPEG_ENABLE_MULTI_RENDITION 控制。
 const VIDEO_RENDITIONS = [
     { name: '360p', height: 360, bandwidth: 1000000, videoBitrate: '800k', maxrate: '1000k', bufsize: '2000k', audioBitrate: '96k' },
     { name: '720p', height: 720, bandwidth: 3000000, videoBitrate: '2500k', maxrate: '3000k', bufsize: '6000k', audioBitrate: '128k' },
@@ -44,7 +65,7 @@ function getLocalVideoUrl(fragmentName) {
     return `http://www.alanarmstrong.xyz/videoPath/${fragmentName}/master.m3u8`;
 }
 
-// 根据视频 key 生成本地 master.m3u8 路径；只要该文件存在，就说明多清晰度切片已经真正完成。
+// 根据视频 key 生成本地 master.m3u8 路径；只要该文件存在，就说明 HLS 切片已经真正完成。
 function getMasterPlaylistPath(fragmentName) {
     return path.resolve(path.join(outputDir, fragmentName, 'master.m3u8'));
 }
@@ -89,15 +110,21 @@ function getVideoProcessStatus(fragmentName) {
     };
 }
 
-// 写入 HLS 主播放列表，前端播放器加载 master.m3u8 后会根据网络自动选择 360p/720p/1080p。
+// 写入 HLS 主播放列表；默认可能只有一档，开启多清晰度后播放器可按网络自动选择。
 function writeMasterPlaylist(folderPath, renditions) {
     const content = [
         '#EXTM3U',
         '#EXT-X-VERSION:3',
-        ...renditions.flatMap((item) => [
-            `#EXT-X-STREAM-INF:BANDWIDTH=${item.bandwidth}`,
-            `${item.name}/index.m3u8`,
-        ]),
+        ...renditions.flatMap((item) => {
+            const streamInfo = [`BANDWIDTH=${item.bandwidth}`];
+            if (item.width && item.height) {
+                streamInfo.push(`RESOLUTION=${item.width}x${item.height}`);
+            }
+            return [
+                `#EXT-X-STREAM-INF:${streamInfo.join(',')}`,
+                `${item.name}/index.m3u8`,
+            ];
+        }),
         '',
     ].join('\n');
     fs.writeFileSync(path.join(folderPath, 'master.m3u8'), content);
@@ -116,18 +143,60 @@ function getFilesRecursive(dir) {
     }, []);
 }
 
-// 读取源视频高度，用于决定是否需要生成 1080p；低分辨率视频不做无意义的放大转码。
-function getVideoHeight(filePath) {
+// 读取源视频编码和分辨率，用于判断是否可以直接切片，以及是否需要压到更小尺寸。
+function getVideoMetadata(filePath) {
     return new Promise((resolve) => {
         ffmpeg.ffprobe(filePath, (err, metadata) => {
             if (err) {
-                logger.info(`============读取视频元信息失败:${err}，将按默认多清晰度处理============`);
-                return resolve(0);
+                logger.info(`============读取视频元信息失败:${err}，将按保守转码策略处理============`);
+                return resolve({});
             }
             const stream = (metadata.streams || []).find((item) => item.codec_type === 'video');
-            resolve(stream && stream.height ? stream.height : 0);
+            const audioStream = (metadata.streams || []).find((item) => item.codec_type === 'audio');
+            resolve({
+                width: stream && stream.width ? stream.width : 0,
+                height: stream && stream.height ? stream.height : 0,
+                videoCodec: stream && stream.codec_name ? stream.codec_name : '',
+                audioCodec: audioStream && audioStream.codec_name ? audioStream.codec_name : '',
+                bitRate: parseInt((metadata.format && metadata.format.bit_rate) || '0', 10) || 0,
+            });
         });
     });
+}
+
+function getBandwidthByHeight(height, fallbackBitRate = 0) {
+    if (fallbackBitRate > 0) return fallbackBitRate;
+    const matched = VIDEO_RENDITIONS.find((item) => item.height >= height) || VIDEO_RENDITIONS[VIDEO_RENDITIONS.length - 1];
+    return matched.bandwidth;
+}
+
+function isCopyFriendlyVideo(metadata) {
+    if (!FFMPEG_COPY_WHEN_COMPATIBLE) return false;
+    if (metadata.videoCodec !== 'h264') return false;
+    if (metadata.height && metadata.height > FFMPEG_COPY_MAX_HEIGHT) return false;
+    // HLS/浏览器对 AAC 最稳；无音轨也可以直接切片。
+    return !metadata.audioCodec || metadata.audioCodec === 'aac';
+}
+
+function getSourceRendition(metadata) {
+    return {
+        name: 'source',
+        width: metadata.width,
+        height: metadata.height,
+        bandwidth: getBandwidthByHeight(metadata.height || 720, metadata.bitRate),
+        copyMode: true,
+    };
+}
+
+function getTranscodeRenditions(metadata) {
+    const maxHeight = metadata.height
+        ? Math.min(metadata.height, FFMPEG_MAX_OUTPUT_HEIGHT)
+        : FFMPEG_MAX_OUTPUT_HEIGHT;
+    const available = VIDEO_RENDITIONS.filter((item) => item.height <= maxHeight);
+    const renditions = available.length ? available : [VIDEO_RENDITIONS[0]];
+
+    // 默认只转一档，减少 CPU 时间；明确开启多清晰度时才按档位逐个生成。
+    return FFMPEG_ENABLE_MULTI_RENDITION ? renditions : [renditions[renditions.length - 1]];
 }
 
 // 控制 ffmpeg 并发：有空位就立即执行，没有空位就排队，前一个任务结束后自动唤醒下一个。
@@ -624,6 +693,13 @@ class VideoControllers {
         // fileHash 优先用于目录名，避免中文文件名、括号等特殊字符在 Linux/nginx/ffmpeg 中产生路径兼容问题。
         const fragmentName = fileHash || fileName;
         const taskName = fileName || fragmentName;
+        if (ffmpegActiveCount >= FFMPEG_MAX_CONCURRENT) {
+            setVideoProcessStatus(fragmentName, 'queued', {
+                progress: 1,
+                queuePosition: ffmpegQueue.length + 1,
+                message: `视频切片排队中，前方还有${ffmpegQueue.length + 1}个任务`,
+            });
+        }
 
         return runFfmpegWithLimit(taskName, async () => {
             const inputPath = path.resolve(path.join(filePath));
@@ -647,14 +723,15 @@ class VideoControllers {
 
             const timeStart = new Date().getTime();
             const masterItems = [];
-            const sourceHeight = await getVideoHeight(inputPath);
-            // 根据源视频高度筛选输出档位，避免 720p 源视频再生成 1080p 这种浪费空间和时间的结果。
-            let renditions = sourceHeight ? VIDEO_RENDITIONS.filter((item) => item.height <= sourceHeight) : VIDEO_RENDITIONS;
-            if (renditions.length === 0) {
-                // 极小分辨率视频至少生成一档 360p，保证前端始终能拿到可播放的 master.m3u8。
-                renditions = [VIDEO_RENDITIONS[0]];
-            }
-            setVideoProcessStatus(fragmentName, 'processing', { progress: 5, message: '开始生成多清晰度播放文件', sourceHeight });
+            const metadata = await getVideoMetadata(inputPath);
+            const useCopyMode = isCopyFriendlyVideo(metadata);
+            const renditions = useCopyMode ? [getSourceRendition(metadata)] : getTranscodeRenditions(metadata);
+            setVideoProcessStatus(fragmentName, 'processing', {
+                progress: 5,
+                message: useCopyMode ? '源视频编码兼容，开始快速切片' : '源视频需要转码，开始生成播放文件',
+                transcodeMode: useCopyMode ? 'copy' : 'transcode',
+                sourceHeight: metadata.height || 0,
+            });
 
             try {
                 for (let i = 0; i < renditions.length; i++) {
@@ -667,7 +744,7 @@ class VideoControllers {
                         message: `正在生成${rendition.name}播放文件`,
                     });
 
-                    const result = await VideoControllers.transcodeHlsRendition({
+                    const result = await VideoControllers.createHlsRendition({
                         inputPath,
                         folderPath,
                         fragmentName,
@@ -685,7 +762,7 @@ class VideoControllers {
                 writeMasterPlaylist(folderPath, masterItems);
                 const timeEnd = new Date().getTime();
                 let time1 = (timeEnd - timeStart) / 1000;
-                logger.info(`============视频${fragmentName}多清晰度切片成功,共耗时${time1}秒============`);
+                logger.info(`============视频${fragmentName}切片成功,模式:${useCopyMode ? 'copy' : 'transcode'},共耗时${time1}秒============`);
                 setVideoProcessStatus(fragmentName, 'success', { progress: 100, message: '视频转码切片完成' });
 
                 if (!scheduleTask[fragmentName]) {
@@ -709,8 +786,8 @@ class VideoControllers {
         });
     }
 
-    // 生成单个清晰度的 HLS 播放列表和 ts 分片；外层已经限制并发，这里每个清晰度按顺序执行。
-    static transcodeHlsRendition(options = {}) {
+    // 生成单个 HLS 播放列表和 ts 分片；兼容编码走 copyMode，不兼容时才重编码。
+    static createHlsRendition(options = {}) {
         const { inputPath, folderPath, fragmentName, rendition, duration } = options;
         return new Promise((resolve, reject) => {
             const renditionDir = path.join(folderPath, rendition.name);
@@ -724,15 +801,28 @@ class VideoControllers {
                 fs.mkdirSync(renditionDir, { recursive: true });
             }
 
-            ffmpeg()
-                .input(inputPath)
-                .format('hls')
-                .outputOptions(
-                    "-y", // 允许重试时覆盖同名清晰度文件。
-                    "-threads", String(FFMPEG_THREADS), // 限制单个 ffmpeg 进程线程数，降低 CPU/内存瞬时占用。
+            const commonOptions = [
+                "-y", // 允许重试时覆盖同名文件。
+                "-threads", String(FFMPEG_THREADS), // 限制单个 ffmpeg 进程线程数，降低 CPU/内存瞬时占用。
+                "-map", "0:v:0",
+                "-map", "0:a:0?",
+                "-sn", // 不处理字幕流，减少不必要的流映射和内存占用。
+                "-hls_list_size", "0",
+                "-hls_playlist_type", "vod",
+                "-hls_time", String(duration),
+                "-start_number", "0",
+                "-max_muxing_queue_size", "512",
+                "-hls_segment_filename", segmentPath,
+            ];
+            const codecOptions = rendition.copyMode
+                ? [
+                    "-c", "copy", // 兼容编码直接封装，不做重编码，CPU 消耗最低。
+                ]
+                : [
+                    "-filter_threads", String(FFMPEG_THREADS),
                     "-c:v", "libx264", // 生成网页播放版视频，主动降低码率，解决每个 ts 几十 MB 的问题。
-                    "-preset", "veryfast", // 在画质和转码速度之间取一个偏快的平衡，避免服务器长期满载。
-                    "-crf", "24", // CRF 越大体积越小；24 对博客视频通常比较省流量。
+                    "-preset", FFMPEG_PRESET, // 可通过环境变量调快或调慢编码，默认更偏向省 CPU 时间。
+                    "-crf", FFMPEG_CRF, // CRF 越大体积越小；默认 26 对博客视频比较省流量。
                     "-b:v", rendition.videoBitrate,
                     "-maxrate", rendition.maxrate, // 限制峰值码率，避免某些复杂画面产生超大 ts。
                     "-bufsize", rendition.bufsize,
@@ -742,16 +832,14 @@ class VideoControllers {
                     "-c:a", "aac",
                     "-b:a", rendition.audioBitrate,
                     "-ac", "2",
-                    "-sn", // 不处理字幕流，减少不必要的流映射和内存占用。
-                    "-hls_list_size", "0",
-                    "-hls_playlist_type", "vod",
-                    "-hls_time", String(duration),
                     "-force_key_frames", `expr:gte(t,n_forced*${duration})`, // 强制关键帧对齐切片边界，减少播放器拖动卡顿。
                     "-sc_threshold", "0",
-                    "-start_number", "0",
-                    "-max_muxing_queue_size", "512",
-                    "-hls_segment_filename", segmentPath,
-                )
+                ];
+
+            ffmpeg()
+                .input(inputPath)
+                .format('hls')
+                .outputOptions(...codecOptions, ...commonOptions)
                 .output(m3u8Path)
                 .on("start", (commandLine) => {
                     timeStart = new Date().getTime();
@@ -783,6 +871,8 @@ class VideoControllers {
                     resolve({
                         name: rendition.name,
                         bandwidth: rendition.bandwidth,
+                        width: rendition.width,
+                        height: rendition.height,
                     });
                 })
                 .run();

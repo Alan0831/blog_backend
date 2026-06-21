@@ -9,6 +9,7 @@ const websocketServer = require('./websocket')
 const {LoggerMiddleware} = require('./middlewares/logger.js');
 
 var app = express();
+app.set('trust proxy', true);
 
 function setVideoHeaders(res, filePath) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -49,8 +50,8 @@ app.use('/videoPath', express.static(path.join(__dirname, 'static/video'), {
   index: false,
   setHeaders: setVideoHeaders,
 }));
-app.use(authHandler);
 app.use(LoggerMiddleware);
+app.use(authHandler);
 
 loadRouter(app)
 // app.use('/', user);

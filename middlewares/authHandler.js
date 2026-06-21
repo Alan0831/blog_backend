@@ -65,6 +65,11 @@ module.exports = async (req, res, next) => {
     if (tokenResult.valid) {
         await next();
     } else {
+        req.authError = {
+            errorType: tokenResult.errorType,
+            errorCode: tokenResult.errorCode,
+            expiredAt: tokenResult.expiredAt || null,
+        };
         res.status(401);
         packageResponse('error', {
             data: {
