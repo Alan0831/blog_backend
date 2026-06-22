@@ -4,7 +4,7 @@ const joi = require('joi');
 const { v4: uuidv4 } = require('uuid');
 const { find } = require('../controllers/user');
 const { findIsCollection } = require('../controllers/collection');
-const { logger } = require('../middlewares/logger');
+const { logger, getClientIp } = require('../middlewares/logger');
 const { normalizePartition, getPartitionWhere } = require('../utils/partition');
 const { appendArticleClassFilter, appendContentListFilter, appendKeywordFilter } = require('../utils/contentListFilter');
 
@@ -109,7 +109,7 @@ class ArticleControllers {
         } = req.body;
         // partition 是可选筛选项；只有前端明确传入时才按分区过滤。
         const partitionWhere = String(partition || '').trim() ? getPartitionWhere(partition) : {};
-        let localIP = req?.socket?.remoteAddress || '';
+        const localIP = getClientIp(req);
         let articleOrder = [['createdAt', 'DESC']];
         let author = '';
         let findParam = {};
@@ -251,7 +251,7 @@ class ArticleControllers {
     // 获取文章详情
     static async findArticleById(req, res, next) {
         const { error } = schemaSearchArticle.validate(req.body);
-        let localIP = req?.socket?.remoteAddress || '';
+        const localIP = getClientIp(req);
         if (error) {
             packageResponse('error', { errorMessage: error }, res);
         } else {

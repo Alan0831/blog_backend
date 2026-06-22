@@ -7,7 +7,7 @@ module.exports = (sequelize, dataTypes) => {
       id: { type: dataTypes.INTEGER(11), primaryKey: true, autoIncrement: true },
       author: { type: dataTypes.STRING(50), allowNull: false },
       title: { type: dataTypes.STRING(255), allowNull: false, unique: true },
-      content: { type: dataTypes.TEXT },
+      content: { type: dataTypes.TEXT('long') },
       viewCount: { type: dataTypes.INTEGER(11), defaultValue: 0 }, // 阅读数
       goodCount: { type: dataTypes.INTEGER(11), defaultValue: 0 }, // 点赞数
       collectionCount: { type: dataTypes.INTEGER(11), defaultValue: 0 }, // 收藏数

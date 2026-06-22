@@ -4,11 +4,12 @@ var path = require('path');
 var cookieParser = require('cookie-parser');
 // var logger = require('morgan');
 const loadRouter = require('./routes');
-const bodyParser = require('body-parser');
 const websocketServer = require('./websocket')
 const {LoggerMiddleware} = require('./middlewares/logger.js');
+const {IpAccessNotifier} = require('./middlewares/ipAccessNotifier.js');
 
 var app = express();
+const REQUEST_BODY_LIMIT = process.env.REQUEST_BODY_LIMIT || '10mb';
 app.set('trust proxy', true);
 
 function setVideoHeaders(res, filePath) {
@@ -34,10 +35,8 @@ app.set('views', path.join(__dirname, 'views'));
 app.set('view engine', 'jade');
 
 // app.use(logger('dev'));
-app.use(express.json());
-app.use(express.urlencoded({ extended: false }));
-app.use(bodyParser.urlencoded({ extended: false }))
-app.use(bodyParser.json())
+app.use(express.json({ limit: REQUEST_BODY_LIMIT }));
+app.use(express.urlencoded({ extended: false, limit: REQUEST_BODY_LIMIT }));
 app.use(cookieParser());
 app.use(express.static(path.join(__dirname, 'public')));
 app.options('/videoPath/*', (req, res) => {
@@ -51,6 +50,7 @@ app.use('/videoPath', express.static(path.join(__dirname, 'static/video'), {
   setHeaders: setVideoHeaders,
 }));
 app.use(LoggerMiddleware);
+app.use(IpAccessNotifier);
 app.use(authHandler);
 
 loadRouter(app)
@@ -63,6 +63,14 @@ loadRouter(app)
 
 // error handler
 app.use(function(err, req, res, next) {
+  if (err && (err.status === 413 || err.type === 'entity.too.large')) {
+    return res.status(413).json({
+      status: 'error',
+      errorCode: 'REQUEST_BODY_TOO_LARGE',
+      errorMessage: `请求内容过大，最大允许 ${REQUEST_BODY_LIMIT}`,
+    });
+  }
+
   res.locals.message = err.message;
   res.locals.error = req.app.get('env') === 'development' ? err : {};
 

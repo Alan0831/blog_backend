@@ -2,7 +2,7 @@ const { video: VideoModel, videocomment: VideoCommentModel, friendcircle: Friend
 const { packageResponse } = require('../utils/packageRespponse')
 const joi = require('joi');
 const { find } = require('../controllers/user');
-const { logger } = require('../middlewares/logger');
+const { logger, getClientIp } = require('../middlewares/logger');
 const { findIsCollection } = require('../controllers/collection');
 const { normalizePartition, getPartitionWhere } = require('../utils/partition');
 const { appendContentListFilter, appendKeywordFilter } = require('../utils/contentListFilter');
@@ -240,30 +240,28 @@ function appendChunkToFile(chunkPath, filePath) {
 }
 
 // 定时任务 处理本地视频文件到阿里云oss
-const task = async function (fileName, folderPath) {
+const task = async function (fileName, sourceFilePath) {
     const videoList = await VideoModel.findAll({ where: { id: { $not: -1 } } });
-    let updatedList = [];
-    for (let i = 0; i < videoList.length; i++) {
-        const videoUrl = videoList[i].videoUrl;
-        const id = videoList[i].id;
-        if (videoUrl.includes(fileName) && videoUrl.includes('videoPath')) {
-            logger.info(`============定时任务开始处理第${i + 1}项,视频id为${id},标题为${videoList[i].title}============`);
-            try {
-                let ossVideoUrl = await VideoControllers.uploadFragment(fileName);
-                updatedList.push({ id, ossVideoUrl });
-                logger.info(`============定时任务处理第${i + 1}项, 视频id为${id}, 标题为${videoList[i].title}成功============`);
-            } catch (err) {
-                logger.info(`============定时任务处理第${i + 1}项, 视频id为${id}, 标题为${videoList[i].title}失败,原因为${err}============`);
-            }
-        }
+    const matchedVideos = videoList.filter((video) => video.videoUrl.includes(fileName) && video.videoUrl.includes('videoPath'));
+    // 只有 OSS 全部上传成功且数据库地址更新成功后，才删除合并出的本地原视频。
+    // 任一步失败都会抛出，让定时任务保留到下一次继续重试。
+    if (matchedVideos.length === 0) {
+        logger.info(`============定时任务未找到${fileName}对应的视频记录，保留本地文件等待下次处理============`);
+        return;
     }
-    // 拿到需要更新的url更新；如果本轮没有匹配到视频记录，就只停止任务，避免空数组报错。
-    if (updatedList.length > 0) {
-        let id = updatedList[0].id;
-        let ossVideoUrl = updatedList[0].ossVideoUrl;
-        await VideoModel.update({ videoUrl: ossVideoUrl }, { where: { id } });
+    logger.info(`============定时任务开始处理视频${fileName}，匹配到${matchedVideos.length}条记录============`);
+    const ossVideoUrl = await VideoControllers.uploadFragment(fileName);
+    for (const video of matchedVideos) {
+        await VideoModel.update({ videoUrl: ossVideoUrl }, { where: { id: video.id } });
     }
-    // uploadFragment 已经递归上传并清理本地目录，这里不再重复读取/删除文件夹。
+    const hlsFolderPath = path.resolve(path.join(__dirname, `../static/video/${fileName}`));
+    fs.rmSync(hlsFolderPath, { recursive: true, force: true });
+    logger.info(`============OSS上传及数据库更新成功，删除本地HLS目录${hlsFolderPath}============`);
+    if (sourceFilePath && fs.existsSync(sourceFilePath)) {
+        fs.unlinkSync(sourceFilePath);
+        logger.info(`============OSS上传及数据库更新成功，删除本地原视频${sourceFilePath}============`);
+    }
+    // 清理完成后停止该视频的定时任务。
     scheduleTask[fileName] && scheduleTask[fileName].stop();
     delete scheduleTask[fileName];
     logger.info(`============定时任务处理完成============`);
@@ -362,7 +360,7 @@ class VideoControllers {
         } = req.body;
         // partition 是可选筛选项；只有前端明确传入时才按分区过滤。
         const partitionWhere = String(partition || '').trim() ? getPartitionWhere(partition) : {};
-        let localIP = req?.socket?.remoteAddress || '';
+        const localIP = getClientIp(req);
         let videoOrder = [['createdAt', 'DESC']];
         let findParam = {};
         const commonFilter = { author: filterAuthor, title, visibleType, createdAtStart, createdAtEnd };
@@ -454,7 +452,7 @@ class VideoControllers {
     // 获取视频详情
     static async findVideoById(req, res, next) {
         const { error } = schemaSearchVideo.validate(req.body);
-        let localIP = req?.socket?.remoteAddress || '';
+        const localIP = getClientIp(req);
         if (error) {
             packageResponse('error', { errorMessage: error }, res);
         } else {
@@ -766,7 +764,11 @@ class VideoControllers {
                 setVideoProcessStatus(fragmentName, 'success', { progress: 100, message: '视频转码切片完成' });
 
                 if (!scheduleTask[fragmentName]) {
-                    scheduleTask[fragmentName] = new TaskScheduler(SCHEDULE_TIME, () => task(fragmentName, folderPath, userId));
+                    scheduleTask[fragmentName] = new TaskScheduler(SCHEDULE_TIME, () => {
+                        task(fragmentName, inputPath).catch((err) => {
+                            logger.info(`============视频${fragmentName}定时上传OSS失败，保留本地文件等待下次重试:${err && err.message ? err.message : err}============`);
+                        });
+                    });
                     scheduleTask[fragmentName].start();
                     logger.info(`============启动定时任务============`);
                 }
@@ -893,15 +895,12 @@ class VideoControllers {
             const ossPath = `videos/${fileName}/${relativePath}`;
             const result = await VideoControllers.uploadToOSS(ossPath, filePath);
             logger.info(`============视频${filePath}上传阿里云OSS成功============`);
-            // 如果上传成功，则删除本地文件
-            if (result) {
-                relativePath === 'master.m3u8' && (videoUrl = result);
-                logger.info(`============删除本地文件夹${filePath}成功============`);
-                fs.unlinkSync(filePath);
-            }
+            relativePath === 'master.m3u8' && (videoUrl = result);
         }
-        // 所有文件上传后清理空目录，避免多清晰度子目录长期堆积。
-        fs.rmSync(folderPath, { recursive: true, force: true });
+        if (!videoUrl) {
+            throw new Error(`视频${fileName}上传OSS后未获得master.m3u8地址`);
+        }
+        // 本方法只负责上传；本地切片和原视频由定时任务在数据库更新成功后统一清理。
         const _timeEnd = new Date().getTime();
         let time2 = (_timeEnd - _timeStart) / 1000;
         logger.info(`============${fileName}视频上传阿里云成功,共耗时${time2}秒,url是:${videoUrl}============`);
@@ -915,18 +914,13 @@ class VideoControllers {
     * @returns
      */
     static async uploadToOSS(ossPath, fileName) {
-        try {
-            // 填写OSS文件完整路径和本地文件的完整路径。OSS文件完整路径中不能包含Bucket名称。
-            // 如果本地文件的完整路径中未指定本地路径，则默认从示例程序所属项目对应本地路径中上传文件。
-            const result = await client.put(ossPath, fileName)
-            if (result.res.statusCode === 200) {
-                return result.url;
-            } else {
-                return result;
-            }
-        } catch (e) {
-            return e;
+        // 填写OSS文件完整路径和本地文件的完整路径。OSS文件完整路径中不能包含Bucket名称。
+        // client.put 抛错或返回非 200 都视为失败，交给定时任务下次重试，不能误删本地文件。
+        const result = await client.put(ossPath, fileName);
+        if (!result || !result.res || result.res.statusCode !== 200 || !result.url) {
+            throw new Error(`上传OSS失败:${ossPath}, statusCode:${result && result.res && result.res.statusCode}`);
         }
+        return result.url;
     }
 
 

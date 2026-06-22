@@ -21,11 +21,30 @@ class PublicController {
     static async getFriendCircle(req, res, next) {
         const { pageNum = 1, pageSize = 10, userId } = req.body;
             let findParam =  {
-                where: {userId: 1}, // 限制博主
+                where: {
+                    userId: 1, // 限制博主
+                    // 朋友圈记录不会在文章/视频可见性变化时同步更新，
+                    // 因此这里必须以关联内容当前的 visibleType 为准。
+                    $and: sequelize.literal(`(
+                        (friendcircle.type = 1 AND EXISTS (
+                            SELECT 1 FROM article
+                            WHERE article.id = friendcircle.articleId
+                              AND article.visibleType <> 3
+                        ))
+                        OR (friendcircle.type = 2 AND EXISTS (
+                            SELECT 1 FROM video
+                            WHERE video.id = friendcircle.videoId
+                              AND video.visibleType <> 3
+                        ))
+                        OR friendcircle.type NOT IN (1, 2)
+                    )`)
+                },
                 include: [
                     {
                         model: ArticleModel,
                         as: 'article',
+                        where: { visibleType: { $not: 3 } },
+                        required: false,
                         row: true,
                         attributes: { exclude: ['content'] },
                         include: [{ model: CommentModel, attributes: ['id'], include: [{ model: ReplyModel, attributes: ['id'] }] }]
@@ -33,6 +52,8 @@ class PublicController {
                     {
                         model: VideoModel,
                         as: 'video',
+                        where: { visibleType: { $not: 3 } },
+                        required: false,
                         row: true,
                         include: [{ model: VideoCommentModel, attributes: ['id'], include: [{ model: VideoReplyModel, attributes: ['id'] }] }]
                     },

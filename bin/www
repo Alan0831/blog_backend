@@ -8,7 +8,7 @@ var app = require('../app');
 var debug = require('debug')('commit-service:server');
 var http = require('http');
 const db = require('../models')
-const { ensurePartitionColumns } = require('../utils/partition')
+const { ensurePartitionColumns, ensureArticleContentColumn } = require('../utils/partition')
 /**
  * Get port from environment and store in Express.
  */
@@ -31,6 +31,7 @@ server.listen(port, function () {
   .sync({ force: false }) // If force is true, each DAO will do DROP TABLE IF EXISTS ..., before it tries to create its own table
   .then(async () => {
     await ensurePartitionColumns(db)
+    await ensureArticleContentColumn(db)
     // const initData = require('./initData')
     // initData() // 创建初始化数据
     console.log('sequelize connect success')

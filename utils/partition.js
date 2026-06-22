@@ -44,10 +44,27 @@ async function ensurePartitionColumns(db) {
   }
 }
 
+async function ensureArticleContentColumn(db) {
+  if (!db.article) return;
+
+  const queryInterface = db.sequelize.getQueryInterface();
+  const tableName = db.article.getTableName();
+  const tableInfo = await queryInterface.describeTable(tableName);
+  const currentType = String(tableInfo.content && tableInfo.content.type || '').toUpperCase();
+
+  if (!currentType.includes('LONGTEXT')) {
+    await queryInterface.changeColumn(tableName, 'content', {
+      type: Sequelize.DataTypes.TEXT('long'),
+      allowNull: true,
+    });
+  }
+}
+
 module.exports = {
   DEFAULT_PARTITION,
   PARTITIONS,
   normalizePartition,
   getPartitionWhere,
   ensurePartitionColumns,
+  ensureArticleContentColumn,
 };
